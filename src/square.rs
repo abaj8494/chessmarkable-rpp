@@ -1,8 +1,7 @@
-pub use crate::game::SQ;
-use crate::game::{File, Rank};
 use anyhow::Result;
 use serde::{Deserializer, Serializer};
 use serde_string_derive::SerdeDisplayFromStr;
+use shakmaty::{File as ShakmFile, Rank as ShakmRank, Square as ShakmSquare};
 use std::fmt;
 use thiserror::Error;
 
@@ -19,60 +18,37 @@ pub enum SquareFormatError {
 
 #[derive(PartialEq, Eq, Hash, Copy, Clone, Debug, SerdeDisplayFromStr)]
 #[expected_data_description = "a chess square donated with a letter and a number (e.g. A1)"]
-pub struct Square {
-    sq: SQ,
-}
+pub struct Square(pub ShakmSquare);
 
 impl Square {
     pub fn new(x: usize, y: usize) -> Result<Self> {
-        let x = x as u8;
-        let y = y as u8;
-
-        let file = match x {
-            x if x == File::A as u8 => File::A,
-            x if x == File::B as u8 => File::B,
-            x if x == File::C as u8 => File::C,
-            x if x == File::D as u8 => File::D,
-            x if x == File::E as u8 => File::E,
-            x if x == File::F as u8 => File::F,
-            x if x == File::G as u8 => File::G,
-            x if x == File::H as u8 => File::H,
-            _ => bail!("Invalid File index for pos"),
-        };
-        let rank = match y {
-            y if y == Rank::R1 as u8 => Rank::R1,
-            y if y == Rank::R2 as u8 => Rank::R2,
-            y if y == Rank::R3 as u8 => Rank::R3,
-            y if y == Rank::R4 as u8 => Rank::R4,
-            y if y == Rank::R5 as u8 => Rank::R5,
-            y if y == Rank::R6 as u8 => Rank::R6,
-            y if y == Rank::R7 as u8 => Rank::R7,
-            y if y == Rank::R8 as u8 => Rank::R8,
-            _ => bail!("Invalid Rank index for pos"),
-        };
-        Ok(Square {
-            sq: SQ::make(file, rank),
-        })
+        let file = ShakmFile::ALL.get(x).ok_or_else(|| anyhow!("Invalid File index for pos"))?;
+        let rank = ShakmRank::ALL.get(y).ok_or_else(|| anyhow!("Invalid Rank index for pos"))?;
+        Ok(Square(ShakmSquare::from_coords(*file, *rank)))
     }
 
     pub fn x(&self) -> u8 {
-        self.sq.file() as u8
+        self.0.file() as u8
     }
 
     pub fn y(&self) -> u8 {
-        self.sq.rank() as u8
+        self.0.rank() as u8
+    }
+
+    pub fn inner(&self) -> ShakmSquare {
+        self.0
     }
 }
 
-impl From<SQ> for Square {
-    fn from(sq: SQ) -> Self {
-        Square { sq }
+impl From<ShakmSquare> for Square {
+    fn from(sq: ShakmSquare) -> Self {
+        Square(sq)
     }
 }
 
-impl Into<SQ> for Square {
-    fn into(self) -> SQ {
-        *self.clone()
+impl From<Square> for ShakmSquare {
+    fn from(sq: Square) -> ShakmSquare {
+        sq.0
     }
 }
 
@@ -117,19 +93,5 @@ impl fmt::Display for Square {
             FILES[self.x() as usize],
             RANKS[self.y() as usize]
         )
-    }
-}
-
-impl std::ops::Deref for Square {
-    type Target = SQ;
-
-    fn deref(&self) -> &Self::Target {
-        &self.sq
-    }
-}
-
-impl std::ops::DerefMut for Square {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.sq
     }
 }

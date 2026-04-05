@@ -1,5 +1,5 @@
 /// The chess logic
-/// Intended to be a seperatable lib (and support interop with other langs later).
+/// Intended to be a separatable lib (and support interop with other langs later).
 
 #[macro_use]
 extern crate anyhow;

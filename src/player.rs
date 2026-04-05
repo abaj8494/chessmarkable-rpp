@@ -1,4 +1,4 @@
-use pleco::Player as PlecoPlayer;
+use shakmaty::Color as ShakmColor;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -18,20 +18,20 @@ impl Player {
     }
 }
 
-impl From<PlecoPlayer> for Player {
-    fn from(pleco_player: PlecoPlayer) -> Self {
-        match pleco_player {
-            PlecoPlayer::Black => Player::Black,
-            PlecoPlayer::White => Player::White,
+impl From<ShakmColor> for Player {
+    fn from(color: ShakmColor) -> Self {
+        match color {
+            ShakmColor::Black => Player::Black,
+            ShakmColor::White => Player::White,
         }
     }
 }
 
-impl Into<PlecoPlayer> for Player {
-    fn into(self) -> PlecoPlayer {
-        match self {
-            Player::Black => PlecoPlayer::Black,
-            Player::White => PlecoPlayer::White,
+impl From<Player> for ShakmColor {
+    fn from(player: Player) -> ShakmColor {
+        match player {
+            Player::Black => ShakmColor::Black,
+            Player::White => ShakmColor::White,
         }
     }
 }

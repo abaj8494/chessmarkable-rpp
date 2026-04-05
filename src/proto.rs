@@ -1,15 +1,14 @@
 use crate::game::ChessGame;
-use crate::game::Player as PlecoPlayer;
-pub use crate::game::{ChessOutcome, SQ};
+pub use crate::game::{move_dst, move_src, ChessOutcome};
 use crate::{Player, Square};
 use anyhow::{Context, Result};
-use pleco::tools::Searcher;
 use serde::{Deserialize, Serialize};
+use shakmaty::{Chess, Move as ShakmMove, Position, Role, Square as ShakmSquare};
 use std::thread;
 use std::time::{Duration, SystemTime};
-use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::task;
+use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 
 #[derive(Clone, Debug)]
 pub struct ChessConfig {
@@ -40,8 +39,6 @@ impl ChessRequest {
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ChessUpdate {
-    /// Usually the Response to `ChessRequest::CurrentBoard`.
-    /// But may be sent at other points to synchronize state as well.
     Board {
         fen: String,
     },
@@ -50,15 +47,11 @@ pub enum ChessUpdate {
         moved_piece_source: Square,
         moved_piece_destination: Square,
     },
-    /// Signal that a new player is now playing. The boar is the
-    /// most recent one which can also be retreived by requesting a
-    /// `ChessUpdate::Board` response.
     PlayerSwitch {
         player: Player,
         fen: String,
     },
     MovePieceFailedResponse {
-        // Response to `ChessRequest::MovePiece` when the action failed
         message: String,
         fen: String,
     },
@@ -68,7 +61,6 @@ pub enum ChessUpdate {
     PossibleMoves {
         possible_moves: Vec<(Square /* From */, Square /* To */)>,
     },
-    /// Something went wrong and the server wants to tell you about it
     GenericErrorResponse {
         message: String,
     },
@@ -81,7 +73,18 @@ pub enum ChessUpdate {
     },
     CurrentTotalMovesReponse {
         total_moves: u16,
-    }
+    },
+}
+
+fn moves_to_square_pairs(game: &ChessGame) -> Vec<(Square, Square)> {
+    game.possible_moves()
+        .iter()
+        .filter_map(|m| {
+            let src = move_src(m)?;
+            let dst = move_dst(m);
+            Some((Square::from(src), Square::from(dst)))
+        })
+        .collect()
 }
 
 pub async fn create_game(
@@ -102,7 +105,6 @@ pub async fn create_game(
 
     let (combined_tx, combined_rx) = channel::<(Option<Player>, ChessRequest)>(1024);
 
-    // Wrap with tokio_stream's wrapper to have them implement Stream
     let mut white_rx = ReceiverStream::new(white_rx);
     let mut black_rx = ReceiverStream::new(black_rx);
     let mut spectators_rx = ReceiverStream::new(spectators_rx);
@@ -116,8 +118,6 @@ pub async fn create_game(
         };
     }
 
-    // Redirect all rx streams into `combined_rx` with a supplied player for cleaner handling
-    // TODO: Shorten/cleanup code
     let combined_white_tx = combined_tx.clone();
     task::spawn(async move {
         let player = Some(Player::White);
@@ -137,7 +137,7 @@ pub async fn create_game(
                     return;
                 }
             };
-            if let Err(_) = combined_white_tx.send((player, update)).await {
+            if combined_white_tx.send((player, update)).await.is_err() {
                 return;
             }
         }
@@ -149,7 +149,11 @@ pub async fn create_game(
                 Some(update) => update,
                 None => return,
             };
-            if let Err(_) = combined_black_tx.send((Some(Player::Black), update)).await {
+            if combined_black_tx
+                .send((Some(Player::Black), update))
+                .await
+                .is_err()
+            {
                 return;
             }
         }
@@ -161,26 +165,25 @@ pub async fn create_game(
                 Some(update) => update,
                 None => return,
             };
-            if let Err(_) = combined_spectators_tx.send((None, update)).await {
+            if combined_spectators_tx
+                .send((None, update))
+                .await
+                .is_err()
+            {
                 return;
             }
         }
     });
 
-    // Start (if not using a FEN then white starts)
+    // Start
     send_to_everyone!(ChessUpdate::PlayerSwitch {
         player: game.turn(),
         fen: game.fen()
     });
-    // Send the starting player his possible moves
-    let possible_moves: Vec<_> = game
-        .possible_moves()
-        .iter()
-        .map(|bit_move| (bit_move.get_src().into(), bit_move.get_dest().into()))
-        .collect();
+    let possible_moves = moves_to_square_pairs(&game);
     match game.turn() {
-        PlecoPlayer::White => white_tx.clone(),
-        PlecoPlayer::Black => black_tx.clone(),
+        Player::White => white_tx.clone(),
+        Player::Black => black_tx.clone(),
     }
     .send(ChessUpdate::PossibleMoves { possible_moves })
     .await
@@ -188,12 +191,11 @@ pub async fn create_game(
 
     info!("Game initialized. Handling requests...");
 
-    // Handle inputs
     loop {
         let (sender, request): (Option<Player>, ChessRequest) = match combined_rx.next().await {
             Some(res) => res,
             None => {
-                break; // No senders connected anymore
+                break;
             }
         };
 
@@ -228,7 +230,6 @@ pub async fn create_game(
             };
         }
 
-        // Requests that players as well as spectators can send
         match request {
             ChessRequest::CurrentBoard => {
                 send_to_sender!(ChessUpdate::Board { fen: game.fen() });
@@ -243,12 +244,11 @@ pub async fn create_game(
                     outcome: game.outcome()
                 });
             }
-            _ => {} // Should be handles for a player request
+            _ => {}
         }
 
-        // Requests that only players can send
         let sender = sender
-            .context("available_to_spectator() is probably not up to date with the handlers (message that has to be playerspecific was sent from a spectator)!!!")?;
+            .context("available_to_spectator() is probably not up to date with the handlers")?;
         match request {
             ChessRequest::MovePiece {
                 source,
@@ -257,7 +257,6 @@ pub async fn create_game(
                 let prev_outcome = game.outcome();
                 match game.move_piece(source, destination) {
                     Ok(_) => {
-                        // Dunno why, but rust won't compile when using just "Ok". Error in the matrix??
                         send_to_everyone!(ChessUpdate::PlayerMovedAPiece {
                             player: sender,
                             moved_piece_source: source,
@@ -270,24 +269,14 @@ pub async fn create_game(
                             });
                         }
 
-                        // Signal other player that he can make his move (as long as not game over)
                         send_to_everyone!(ChessUpdate::PlayerSwitch {
                             player: game.turn(),
                             fen: game.fen(),
                         });
 
                         if new_outcome.is_none() {
-                            // Send possible moves to player
-                            send_to_other_player!(ChessUpdate::PossibleMoves {
-                                possible_moves: game
-                                    .possible_moves()
-                                    .iter()
-                                    .map(|bit_move| (
-                                        bit_move.get_src().into(),
-                                        bit_move.get_dest().into()
-                                    ))
-                                    .collect(),
-                            });
+                            let possible_moves = moves_to_square_pairs(&game);
+                            send_to_other_player!(ChessUpdate::PossibleMoves { possible_moves });
                         }
                     }
                     Err(e) => {
@@ -298,81 +287,252 @@ pub async fn create_game(
                     }
                 };
             }
-            ChessRequest::Abort { .. /* message */ } => {
+            ChessRequest::Abort { .. } => {
                 game.player_left(sender);
                 break;
-            },
+            }
             ChessRequest::UndoMoves { moves } => {
                 let player_allowed = match sender {
                     Player::Black => config.can_black_undo,
                     Player::White => config.can_white_undo,
                 };
-                if ! player_allowed {
+                if !player_allowed {
                     send_to_sender!(ChessUpdate::UndoMovesFailedResponse {
                         message: "You are not permitted to do that in this game.".to_owned(),
                     });
-                } else if !(game.turn() == sender && game.outcome().is_none() || game.outcome().is_some() && config.allow_undo_after_loose) {
+                } else if !(game.turn() == sender && game.outcome().is_none()
+                    || game.outcome().is_some() && config.allow_undo_after_loose)
+                {
                     if config.allow_undo_after_loose {
                         send_to_sender!(ChessUpdate::UndoMovesFailedResponse {
-                            message: "You can only undo when you are playing or it's game over.".to_owned(),
+                            message:
+                                "You can only undo when you are playing or it's game over."
+                                    .to_owned(),
                         });
-                    }else {
+                    } else {
                         send_to_sender!(ChessUpdate::UndoMovesFailedResponse {
                             message: "You can only undo when you are playing.".to_owned(),
-                    });
+                        });
                     }
-                }else {
+                } else {
                     let prev_outcome = game.outcome();
                     if let Err(e) = game.undo(moves) {
                         send_to_sender!(ChessUpdate::UndoMovesFailedResponse {
                             message: format!("Denied by engine: {}", e),
                         });
-                    }else {
+                    } else {
                         let new_outcome = game.outcome();
                         if prev_outcome != new_outcome {
                             send_to_everyone!(ChessUpdate::Outcome {
                                 outcome: new_outcome
                             });
                         }
-                        // Select current player and update board
                         send_to_everyone!(ChessUpdate::PlayerSwitch {
                             player: game.turn(),
                             fen: game.fen()
                         });
-                        // Send the starting player his possible moves
-                        let possible_moves: Vec<_> = game
-                            .possible_moves()
-                            .iter()
-                            .map(|bit_move| (bit_move.get_src().into(), bit_move.get_dest().into()))
-                            .collect();
+                        let possible_moves = moves_to_square_pairs(&game);
                         match game.turn() {
-                            PlecoPlayer::White => white_tx.clone(),
-                            PlecoPlayer::Black => black_tx.clone(),
+                            Player::White => white_tx.clone(),
+                            Player::Black => black_tx.clone(),
                         }
                         .send(ChessUpdate::PossibleMoves { possible_moves })
                         .await
                         .ok();
-                        // Notify everyone of undo
                         send_to_everyone!(ChessUpdate::MovesUndone {
                             who: sender,
                             moves,
                         });
-
                     }
                 }
             }
             _ => {
-                bail!("available_to_spectator() is probably not up to date with the handlers (player specific handler found a unhandled entry)!!!");
+                bail!("Unhandled player-specific request");
             }
         };
     }
 
-    // Potential cleanup here
     info!("Game terminated seemingly gracefully");
     Ok(())
 }
 
-pub async fn create_bot<T: Searcher>(
+// --- Alpha-Beta Search Bot ---
+
+/// Piece-square tables for positional evaluation (from white's perspective).
+/// Values are centipawns bonus for each square.
+const PAWN_TABLE: [i32; 64] = [
+     0,  0,  0,  0,  0,  0,  0,  0,
+    50, 50, 50, 50, 50, 50, 50, 50,
+    10, 10, 20, 30, 30, 20, 10, 10,
+     5,  5, 10, 25, 25, 10,  5,  5,
+     0,  0,  0, 20, 20,  0,  0,  0,
+     5, -5,-10,  0,  0,-10, -5,  5,
+     5, 10, 10,-20,-20, 10, 10,  5,
+     0,  0,  0,  0,  0,  0,  0,  0,
+];
+
+const KNIGHT_TABLE: [i32; 64] = [
+    -50,-40,-30,-30,-30,-30,-40,-50,
+    -40,-20,  0,  0,  0,  0,-20,-40,
+    -30,  0, 10, 15, 15, 10,  0,-30,
+    -30,  5, 15, 20, 20, 15,  5,-30,
+    -30,  0, 15, 20, 20, 15,  0,-30,
+    -30,  5, 10, 15, 15, 10,  5,-30,
+    -40,-20,  0,  5,  5,  0,-20,-40,
+    -50,-40,-30,-30,-30,-30,-40,-50,
+];
+
+const BISHOP_TABLE: [i32; 64] = [
+    -20,-10,-10,-10,-10,-10,-10,-20,
+    -10,  0,  0,  0,  0,  0,  0,-10,
+    -10,  0, 10, 10, 10, 10,  0,-10,
+    -10,  5,  5, 10, 10,  5,  5,-10,
+    -10,  0,  5, 10, 10,  5,  0,-10,
+    -10, 10, 10, 10, 10, 10, 10,-10,
+    -10,  5,  0,  0,  0,  0,  5,-10,
+    -20,-10,-10,-10,-10,-10,-10,-20,
+];
+
+const ROOK_TABLE: [i32; 64] = [
+     0,  0,  0,  0,  0,  0,  0,  0,
+     5, 10, 10, 10, 10, 10, 10,  5,
+    -5,  0,  0,  0,  0,  0,  0, -5,
+    -5,  0,  0,  0,  0,  0,  0, -5,
+    -5,  0,  0,  0,  0,  0,  0, -5,
+    -5,  0,  0,  0,  0,  0,  0, -5,
+    -5,  0,  0,  0,  0,  0,  0, -5,
+     0,  0,  0,  5,  5,  0,  0,  0,
+];
+
+fn material_value(role: Role) -> i32 {
+    match role {
+        Role::Pawn => 100,
+        Role::Knight => 320,
+        Role::Bishop => 330,
+        Role::Rook => 500,
+        Role::Queen => 900,
+        Role::King => 20000,
+    }
+}
+
+fn piece_square_value(role: Role, sq: ShakmSquare, is_white: bool) -> i32 {
+    // Square index: a1=0, b1=1, ..., h8=63
+    // Tables are from white's perspective (rank 8 at top = index 0..7)
+    let idx = if is_white {
+        // Flip: white pieces use table from rank 8 perspective
+        (7 - sq.rank() as usize) * 8 + sq.file() as usize
+    } else {
+        sq.rank() as usize * 8 + sq.file() as usize
+    };
+
+    match role {
+        Role::Pawn => PAWN_TABLE[idx],
+        Role::Knight => KNIGHT_TABLE[idx],
+        Role::Bishop => BISHOP_TABLE[idx],
+        Role::Rook => ROOK_TABLE[idx],
+        _ => 0,
+    }
+}
+
+fn evaluate(pos: &Chess) -> i32 {
+    let board = pos.board();
+    let mut score = 0i32;
+
+    for sq in ShakmSquare::ALL {
+        if let Some(piece) = board.piece_at(sq) {
+            let val = material_value(piece.role) + piece_square_value(piece.role, sq, piece.color == shakmaty::Color::White);
+            if piece.color == shakmaty::Color::White {
+                score += val;
+            } else {
+                score -= val;
+            }
+        }
+    }
+
+    // Bonus for mobility
+    let moves = pos.legal_moves().len() as i32;
+    if pos.turn() == shakmaty::Color::White {
+        score += moves * 2;
+    } else {
+        score -= moves * 2;
+    }
+
+    score
+}
+
+fn alpha_beta(pos: &Chess, depth: u16, mut alpha: i32, beta: i32, maximizing: bool) -> i32 {
+    if depth == 0 || pos.is_game_over() {
+        if pos.is_checkmate() {
+            return if maximizing { -100000 } else { 100000 };
+        }
+        if pos.is_stalemate() || pos.is_insufficient_material() {
+            return 0;
+        }
+        return evaluate(pos);
+    }
+
+    let moves = pos.legal_moves();
+
+    if maximizing {
+        let mut max_eval = i32::MIN;
+        for m in moves.iter() {
+            let mut new_pos = pos.clone();
+            new_pos.play_unchecked(m.clone());
+            let eval = alpha_beta(&new_pos, depth - 1, alpha, beta, false);
+            max_eval = max_eval.max(eval);
+            alpha = alpha.max(eval);
+            if beta <= alpha {
+                break;
+            }
+        }
+        max_eval
+    } else {
+        let mut min_eval = i32::MAX;
+        for m in moves.iter() {
+            let mut new_pos = pos.clone();
+            new_pos.play_unchecked(m.clone());
+            let eval = alpha_beta(&new_pos, depth - 1, alpha, beta, true);
+            min_eval = min_eval.min(eval);
+            let new_beta = beta.min(eval);
+            if new_beta <= alpha {
+                break;
+            }
+        }
+        min_eval
+    }
+}
+
+pub fn best_move(pos: &Chess, depth: u16) -> Option<ShakmMove> {
+    let moves = pos.legal_moves();
+    if moves.is_empty() {
+        return None;
+    }
+
+    let maximizing = pos.turn() == shakmaty::Color::White;
+    let mut best: Option<ShakmMove> = None;
+    let mut best_eval = if maximizing { i32::MIN } else { i32::MAX };
+
+    for m in moves.iter() {
+        let mut new_pos = pos.clone();
+        new_pos.play_unchecked(m.clone());
+        let eval = alpha_beta(&new_pos, depth - 1, i32::MIN, i32::MAX, !maximizing);
+
+        let is_better = if maximizing {
+            eval > best_eval
+        } else {
+            eval < best_eval
+        };
+
+        if is_better {
+            best_eval = eval;
+            best = Some(m.clone());
+        }
+    }
+
+    best
+}
+
+pub async fn create_bot(
     me: Player,
     depth: u16,
     min_reaction_delay: Duration,
@@ -387,12 +547,19 @@ pub async fn create_bot<T: Searcher>(
             match update {
                 ChessUpdate::PlayerSwitch { player, ref fen } => {
                     if player == me && current_outcome.is_none() {
-                        let board = pleco::Board::from_fen(fen)
-                            .expect("Bot failed to parse the provided fen");
+                        let fen_str = fen.clone();
+                        let search_depth = depth;
 
-                        let bit_move = task::spawn_blocking(move || {
+                        let bot_move = task::spawn_blocking(move || {
                             let started = SystemTime::now();
-                            let bit_move = T::best_move(board, depth);
+
+                            let parsed: shakmaty::fen::Fen = fen_str.parse()
+                                .expect("Bot failed to parse the provided fen");
+                            let pos: Chess =
+                                parsed.into_position(shakmaty::CastlingMode::Standard)
+                                    .expect("Bot failed to create position from fen");
+
+                            let the_move = best_move(&pos, search_depth);
                             let elapsed = started.elapsed().unwrap_or(Duration::new(0, 0));
 
                             if elapsed < min_reaction_delay {
@@ -400,19 +567,23 @@ pub async fn create_bot<T: Searcher>(
                             } else {
                                 info!("Bot took a long time to think: {:?}", elapsed);
                             }
-                            bit_move
+                            the_move
                         })
                         .await
                         .context("Blocking heavy calculation")
                         .unwrap();
 
-                        request_tx
-                            .send(ChessRequest::MovePiece {
-                                source: bit_move.get_src().into(),
-                                destination: bit_move.get_dest().into(),
-                            })
-                            .await
-                            .expect("Bot failed to send move");
+                        if let Some(m) = bot_move {
+                            let src = move_src(&m).unwrap();
+                            let dst = move_dst(&m);
+                            request_tx
+                                .send(ChessRequest::MovePiece {
+                                    source: Square::from(src),
+                                    destination: Square::from(dst),
+                                })
+                                .await
+                                .expect("Bot failed to send move");
+                        }
                     }
                 }
                 ChessUpdate::MovePieceFailedResponse { message, .. } => {
@@ -422,7 +593,6 @@ pub async fn create_bot<T: Searcher>(
                 ChessUpdate::Outcome { outcome } => {
                     if outcome.is_some() {
                         info!("Bot detected that the game ended");
-                    //break;
                     } else {
                         info!("Game continues. Bot will continue playing.");
                     }
@@ -438,8 +608,6 @@ pub async fn create_bot<T: Searcher>(
 }
 
 pub fn stubbed_spectator() -> (Sender<ChessUpdate>, Receiver<ChessRequest>) {
-    // Channel size doesn't matter since the channels are closed after this
-    // function returns since one side of each channel gets dropped at that point.
     let (update_tx, _) = channel::<ChessUpdate>(1);
     let (_, request_rx) = channel::<ChessRequest>(1);
     (update_tx, request_rx)

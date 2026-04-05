@@ -12,8 +12,8 @@ pub use pgn_select_scene::PgnSelectScene;
 pub use replay_scene::ReplayScene;
 
 use crate::canvas::Canvas;
+use crate::rmpp_hal::types::InputEvent;
 use downcast_rs::Downcast;
-use libremarkable::input::InputEvent;
 
 pub trait Scene: Downcast {
     fn on_input(&mut self, _event: InputEvent) {}

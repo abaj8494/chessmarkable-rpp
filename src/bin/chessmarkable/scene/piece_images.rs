@@ -1,5 +1,5 @@
-use chessmarkable::game::Piece;
-use libremarkable::image;
+use image;
+use shakmaty::{Color as ShakmColor, Piece as ShakmPiece, Role};
 
 lazy_static! {
 
@@ -44,21 +44,19 @@ lazy_static! {
             .expect("Failed to load resource as image!");
 }
 
-pub fn get_orig_piece_img(piece: &Piece) -> &'static image::DynamicImage {
-    match *piece {
-        Piece::BlackKing => &IMG_KING_BLACK,
-        Piece::BlackQueen => &IMG_QUEEN_BLACK,
-        Piece::BlackBishop => &IMG_BISHOP_BLACK,
-        Piece::BlackRook => &IMG_ROOK_BLACK,
-        Piece::BlackKnight => &IMG_KNIGHT_BLACK,
-        Piece::BlackPawn => &IMG_PAWN_BLACK,
-        Piece::WhiteKing => &IMG_KING_WHITE,
-        Piece::WhiteQueen => &IMG_QUEEN_WHITE,
-        Piece::WhiteBishop => &IMG_BISHOP_WHITE,
-        Piece::WhiteRook => &IMG_ROOK_WHITE,
-        Piece::WhiteKnight => &IMG_KNIGHT_WHITE,
-        Piece::WhitePawn => &IMG_PAWN_WHITE,
-        Piece::None => panic!("Cannot get img for Piece::None"),
+pub fn get_orig_piece_img(piece: &ShakmPiece) -> &'static image::DynamicImage {
+    match (piece.color, piece.role) {
+        (ShakmColor::Black, Role::King) => &IMG_KING_BLACK,
+        (ShakmColor::Black, Role::Queen) => &IMG_QUEEN_BLACK,
+        (ShakmColor::Black, Role::Bishop) => &IMG_BISHOP_BLACK,
+        (ShakmColor::Black, Role::Rook) => &IMG_ROOK_BLACK,
+        (ShakmColor::Black, Role::Knight) => &IMG_KNIGHT_BLACK,
+        (ShakmColor::Black, Role::Pawn) => &IMG_PAWN_BLACK,
+        (ShakmColor::White, Role::King) => &IMG_KING_WHITE,
+        (ShakmColor::White, Role::Queen) => &IMG_QUEEN_WHITE,
+        (ShakmColor::White, Role::Bishop) => &IMG_BISHOP_WHITE,
+        (ShakmColor::White, Role::Rook) => &IMG_ROOK_WHITE,
+        (ShakmColor::White, Role::Knight) => &IMG_KNIGHT_WHITE,
+        (ShakmColor::White, Role::Pawn) => &IMG_PAWN_WHITE,
     }
 }
-

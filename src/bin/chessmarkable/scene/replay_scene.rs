@@ -1,12 +1,13 @@
 use super::Scene;
 use crate::canvas::*;
 use crate::CLI_OPTS;
-use chessmarkable::{Square};
+use crate::rmpp_hal::types::{InputEvent, MultitouchEvent};
+use chessmarkable::game::{move_dst, move_src, piece_to_char, ChessPiece};
+use chessmarkable::Square;
 use fxhash::{FxHashMap, FxHashSet};
-use libremarkable::image::{self, imageops::FilterType};
-use pleco::{Board, Piece};
+use image::{self, imageops::FilterType};
+use shakmaty::{Chess, Color as ShakmColor, Piece as ShakmPiece, Position, Role, Square as ShakmSquare};
 use std::time::{Duration, SystemTime};
-use libremarkable::input::{GPIOEvent, InputEvent, MultitouchEvent, PhysicalButton};
 use chess_pgn_parser::Game;
 use chessmarkable::replay::{Replay, ReplayResponse};
 use crate::scene::game_scene::ALL_PIECES;
@@ -16,6 +17,8 @@ use crate::scene::game_scene::IMG_PIECE_SELECTED;
 use crate::scene::game_scene::IMG_PIECE_MOVEHINT;
 use crate::scene::game_scene::IMG_PIECE_MOVED_FROM;
 use crate::pgns::Pgn;
+use shakmaty::fen::Fen;
+use shakmaty::{CastlingMode, EnPassantMode};
 
 
 #[inline]
@@ -24,7 +27,7 @@ fn to_square(x: usize, y: usize) -> Square {
 }
 
 pub struct ReplayScene {
-    board: Board,
+    board: Chess,
     first_draw: bool,
     back_button_hitbox: Option<mxcfb_rect>,
     undo_button_hitbox: Option<mxcfb_rect>,
@@ -67,7 +70,7 @@ impl ReplayScene {
         selected_pgn: Option<Pgn>,
     ) -> Self {
         // Size of board
-        let square_size = DISPLAYWIDTH as u32 / 8;
+        let square_size = crate::DISPLAY_WIDTH / 8;
         let piece_padding = square_size / 10;
         let overlay_padding = square_size / 20;
 
@@ -77,8 +80,8 @@ impl ReplayScene {
             let mut y_axis = Vec::new();
             for y in 0..8 {
                 y_axis.push(mxcfb_rect {
-                    left: ((DISPLAYWIDTH as u32 - square_size * 8) / 2) + square_size * x,
-                    top: ((DISPLAYHEIGHT as u32 - square_size * 8) / 2) + square_size * (7 - y),
+                    left: ((crate::DISPLAY_WIDTH - square_size * 8) / 2) + square_size * x,
+                    top: ((crate::DISPLAY_HEIGHT - square_size * 8) / 2) + square_size * (7 - y),
                     width: square_size,
                     height: square_size,
                 });
@@ -90,7 +93,7 @@ impl ReplayScene {
         let mut img_pieces: FxHashMap<char, image::DynamicImage> = Default::default();
         for piece in ALL_PIECES.iter() {
             img_pieces.insert(
-                piece.character_lossy(),
+                piece_to_char(*piece),
                 get_orig_piece_img(piece).resize(
                     square_size - piece_padding * 2,
                     square_size - piece_padding * 2,
@@ -115,7 +118,7 @@ impl ReplayScene {
 
         //Replay Info
         Self {
-            board: Board::default(), // Temporary default (usually stays that but will change when having a custom fen)
+            board: Chess::default(),
             first_draw: true,
             piece_hitboxes,
             piece_padding,
@@ -153,7 +156,7 @@ impl ReplayScene {
         let mut updated_regions = vec![];
         for x in 0..8 {
             for y in 0..8 {
-                let square = to_square(x, y); // Flip board so white is at the bottom
+                let square = to_square(x, y);
                 if !self.redraw_all_squares && !self.redraw_squares.contains(&square) {
                     continue;
                 }
@@ -179,7 +182,6 @@ impl ReplayScene {
                 //
                 // Underlay / Background layers
                 //
-                // Also highlight squares from previous move
                 if self.last_move_from.is_some() && self.last_move_from.unwrap() == square {
                     canvas.draw_image(
                         bounds.top_left().cast().unwrap(),
@@ -198,11 +200,11 @@ impl ReplayScene {
                 //
                 // Piece
                 //
-                let piece = self.board.piece_at_sq(*square);
-                if piece != Piece::None {
-                    // Actual piece here
+                let shakm_sq = square.inner();
+                let piece = self.board.board().piece_at(shakm_sq);
+                if let Some(piece) = piece {
                     let piece_img = &self.img_pieces
-                        .get(&piece.character_lossy())
+                        .get(&piece_to_char(piece))
                         .expect("Failed to find resized piece img!");
                     canvas.draw_image(
                         Point2 {
@@ -217,8 +219,7 @@ impl ReplayScene {
                 //
                 // Overlay
                 //
-                // Overlay image if square is selected
-                if piece != Piece::None
+                if piece.is_some()
                     && self.selected_square.is_some()
                     && self.selected_square.unwrap() == square
                 {
@@ -232,7 +233,7 @@ impl ReplayScene {
                     );
                 }
 
-                // Display postions a selected chess piece could move to
+                // Display positions a selected chess piece could move to
                 if self.move_hints.contains(&square) {
                     canvas.draw_image(
                         Point2 {
@@ -249,7 +250,6 @@ impl ReplayScene {
         }
 
         if self.redraw_all_squares || !CLI_OPTS.no_merge {
-            // Update full board instead of every single position
             updated_regions.clear();
             updated_regions.push(self.full_board_rect());
         }
@@ -315,7 +315,9 @@ impl ReplayScene {
         self.clear_move_hints();
         self.clear_last_moved_hints();
         self.possible_moves = self.replay.possible_moves().iter()
-            .map(|bit_move| (bit_move.get_src().into(), bit_move.get_dest().into()))
+            .filter_map(|m| {
+                move_src(m).map(|src| (Square::from(src), Square::from(move_dst(m))))
+            })
             .collect();
     }
 
@@ -328,13 +330,20 @@ impl ReplayScene {
     }
 
     fn update_board(&mut self, fen: &str) {
-        if self.board.fen() == fen {
+        let current_fen = Fen::from_position(&self.board, EnPassantMode::Legal).to_string();
+        if current_fen == fen {
             debug!("Ignored unchanged board");
         }
         info!("Updated FEN: {}", fen);
 
-        let new_board = match Board::from_fen(fen) {
-            Ok(board) => board,
+        let new_board: Chess = match fen.parse::<Fen>() {
+            Ok(parsed_fen) => match parsed_fen.into_position(CastlingMode::Standard) {
+                Ok(pos) => pos,
+                Err(e) => {
+                    warn!("Failed to parse fen \"{}\". Error: {:?}", fen, e);
+                    return;
+                }
+            },
             Err(e) => {
                 warn!("Failed to parse fen \"{}\". Error: {:?}", fen, e);
                 return;
@@ -345,8 +354,9 @@ impl ReplayScene {
         for x in 0..8 {
             for y in 0..8 {
                 let sq = to_square(x, y);
-                let old_piece = self.board.piece_at_sq(*sq);
-                let new_piece = new_board.piece_at_sq(*sq);
+                let shakm_sq = sq.inner();
+                let old_piece = self.board.board().piece_at(shakm_sq);
+                let new_piece = new_board.board().piece_at(shakm_sq);
 
                 if old_piece != new_piece {
                     self.redraw_squares.insert(sq);
@@ -369,24 +379,6 @@ impl ReplayScene {
 impl Scene for ReplayScene {
     fn on_input(&mut self, event: InputEvent) {
         match event {
-            InputEvent::GPIO { event } => {
-                match event {
-                    GPIOEvent::Press { button } => {
-                        match button {
-                            PhysicalButton::RIGHT => {
-                                let response = self.replay.play_replay_move();
-                                self.play_replay_move(response);
-                            },
-                            PhysicalButton::LEFT => {
-                                let response = self.replay.undo_move();
-                                self.play_replay_move(response);
-                            },
-                            _ => {}
-                        }
-                    }
-                    _ => {}
-                }
-            }
             InputEvent::MultitouchEvent { event } => {
                 // Taps and buttons
                 match event {
@@ -448,9 +440,6 @@ impl Scene for ReplayScene {
                                                 self.selected_square = None;
                                                 self.clear_move_hints();
                                             } else {
-                                                // Attempt to move from last_selected_square to new_square if move is
-                                                // in self.possible_moves. Otherwise just select the piece on new_square.
-                                                // See https://github.com/LinusCDE/chessmarkable/issues/14
                                                 let is_possible_move = self
                                                     .possible_moves
                                                     .iter()
@@ -459,23 +448,20 @@ impl Scene for ReplayScene {
                                                             && possible_dest == &new_square
                                                     });
                                                 if is_possible_move {
-                                                    // Move
                                                     self.redraw_squares.insert(new_square.clone());
                                                     self.on_user_move(
                                                         last_selected_square,
                                                         new_square,
                                                     );
                                                 } else {
-                                                    // Select new_square as new selected piece
-                                                    if self.board.piece_at_sq(*new_square)
-                                                        != Piece::None
+                                                    if self.board.board().piece_at(new_square.inner())
+                                                        .is_some()
                                                     {
                                                         self.selected_square = Some(new_square);
                                                         self.redraw_squares
                                                             .insert(new_square.clone());
                                                         self.set_move_hints(new_square);
                                                     } else {
-                                                        // Clear selection
                                                         self.selected_square = None;
                                                         self.clear_move_hints();
                                                     }
@@ -485,16 +471,13 @@ impl Scene for ReplayScene {
                                             let finger_down_square = self
                                                 .finger_down_square
                                                 .unwrap_or(new_square.clone());
-                                            if finger_down_square.0 != new_square.0 {
-                                                // Do immeate move (swiped) without highlighting
-
+                                            if finger_down_square.inner() != new_square.inner() {
                                                 self.redraw_squares
                                                     .insert(finger_down_square.clone());
                                                 self.on_user_move(finger_down_square, new_square);
                                             } else {
-                                                // Mark square
-                                                if self.board.piece_at_sq(*new_square)
-                                                    != Piece::None
+                                                if self.board.board().piece_at(new_square.inner())
+                                                    .is_some()
                                                 {
                                                     self.selected_square = Some(new_square);
                                                     self.redraw_squares.insert(new_square.clone());
@@ -530,7 +513,7 @@ impl Scene for ReplayScene {
             ));
             self.full_refresh_button_hitbox = Some(canvas.draw_button(
                 Point2 {
-                    x: Some((DISPLAYWIDTH - 260) as i32),
+                    x: Some(crate::DISPLAY_WIDTH as i32 - 260),
                     y: Some(1770),
                 },
                 "Refresh",
@@ -607,7 +590,6 @@ impl Scene for ReplayScene {
         if self.move_comment_last_rect.is_some()
             && self.move_comment.is_some()
         {
-            // Clear any previous text
             if let Some(ref last_rect) = self.move_comment_last_rect {
                 canvas.fill_rect(
                     Point2 {
@@ -628,14 +610,12 @@ impl Scene for ReplayScene {
         // Draw a requested text once
         if self.move_comment.is_some() {
             if let Some(ref comment) = self.move_comment {
-                // Old text was cleared above already
-
                 let rect = canvas.draw_multi_line_text(
                     None,
                     40,
                     comment,
                     95,
-                    7, //Comments longer than this will cut into the game screen - Hence a ~660ish characters limit
+                    7,
                     35.0,
                     0.6
                 );

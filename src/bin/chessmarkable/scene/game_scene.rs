@@ -1,13 +1,13 @@
 use super::Scene;
 use crate::canvas::*;
+use crate::rmpp_hal::types::{InputEvent, MultitouchEvent};
 use crate::CLI_OPTS;
+use chessmarkable::game::{piece_to_char, ChessPiece};
 use chessmarkable::proto::*;
 use chessmarkable::{Player, Square};
 use fxhash::{FxHashMap, FxHashSet};
-use libremarkable::image::{self, imageops::FilterType};
-use libremarkable::input::{InputEvent, MultitouchEvent};
-use pleco::bot_prelude::*;
-use pleco::{Board, Piece};
+use image::{self, imageops::FilterType};
+use shakmaty::{Chess, Color as ShakmColor, Piece as ShakmPiece, Position, Role, Square as ShakmSquare};
 use std::time::{Duration, SystemTime};
 use tokio::runtime;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -31,19 +31,19 @@ lazy_static! {
             .expect("Failed to load resource as image!");
 }
 
-pub const ALL_PIECES: &[Piece] = &[
-    Piece::BlackKing,
-    Piece::BlackQueen,
-    Piece::BlackBishop,
-    Piece::BlackRook,
-    Piece::BlackKnight,
-    Piece::BlackPawn,
-    Piece::WhiteKing,
-    Piece::WhiteQueen,
-    Piece::WhiteBishop,
-    Piece::WhiteRook,
-    Piece::WhiteKnight,
-    Piece::WhitePawn,
+pub const ALL_PIECES: &[ShakmPiece] = &[
+    ShakmPiece { color: ShakmColor::Black, role: Role::King },
+    ShakmPiece { color: ShakmColor::Black, role: Role::Queen },
+    ShakmPiece { color: ShakmColor::Black, role: Role::Bishop },
+    ShakmPiece { color: ShakmColor::Black, role: Role::Rook },
+    ShakmPiece { color: ShakmColor::Black, role: Role::Knight },
+    ShakmPiece { color: ShakmColor::Black, role: Role::Pawn },
+    ShakmPiece { color: ShakmColor::White, role: Role::King },
+    ShakmPiece { color: ShakmColor::White, role: Role::Queen },
+    ShakmPiece { color: ShakmColor::White, role: Role::Bishop },
+    ShakmPiece { color: ShakmColor::White, role: Role::Rook },
+    ShakmPiece { color: ShakmColor::White, role: Role::Knight },
+    ShakmPiece { color: ShakmColor::White, role: Role::Pawn },
 ];
 
 #[inline]
@@ -73,7 +73,7 @@ pub enum SavestateSlot {
 }
 
 pub struct GameScene {
-    board: Board,
+    board: Chess,
     /// May be above zero when a fen was imported. Used to prevent panic on undo.
     game_mode: GameMode,
     savestate_slot: SavestateSlot,
@@ -126,7 +126,7 @@ impl GameScene {
         pvp_piece_rotation_enabled: bool,
     ) -> Self {
         // Size of board
-        let square_size = DISPLAYWIDTH as u32 / 8;
+        let square_size = crate::DISPLAY_WIDTH / 8;
         let piece_padding = square_size / 10;
         let overlay_padding = square_size / 20;
 
@@ -136,8 +136,8 @@ impl GameScene {
             let mut y_axis = Vec::new();
             for y in 0..8 {
                 y_axis.push(mxcfb_rect {
-                    left: ((DISPLAYWIDTH as u32 - square_size * 8) / 2) + square_size * x,
-                    top: ((DISPLAYHEIGHT as u32 - square_size * 8) / 2) + square_size * (7 - y),
+                    left: ((crate::DISPLAY_WIDTH - square_size * 8) / 2) + square_size * x,
+                    top: ((crate::DISPLAY_HEIGHT - square_size * 8) / 2) + square_size * (7 - y),
                     width: square_size,
                     height: square_size,
                 });
@@ -149,7 +149,7 @@ impl GameScene {
         let mut img_pieces: FxHashMap<char, image::DynamicImage> = Default::default();
         for piece in ALL_PIECES.iter() {
             img_pieces.insert(
-                piece.character_lossy(),
+                piece_to_char(*piece),
                 get_orig_piece_img(piece).resize(
                     square_size - piece_padding * 2,
                     square_size - piece_padding * 2,
@@ -223,28 +223,14 @@ impl GameScene {
             let (white_update_tx, white_update_rx) = channel::<ChessUpdate>(256);
             let (white_request_tx, white_request_rx) = channel::<ChessRequest>(256);
 
-            // Use multithreaded algo when not rM 1
-            let bot = if libremarkable::device::CURRENT_DEVICE.model
-                == libremarkable::device::Model::Gen1
-            {
-                debug!("The Bot will use the AlphaBeta algorithm (singlethreaded)");
-                runtime
-                    .block_on(create_bot::<AlphaBetaSearcher>(
-                        Player::Black,
-                        game_mode as u16,
-                        Duration::from_millis(CLI_OPTS.bot_reaction_delay.into()),
-                    ))
-                    .expect("Failed to initialize bot task")
-            } else {
-                debug!("The Bot will use the Jamboree algorithm (multithreaded)");
-                runtime
-                    .block_on(create_bot::<JamboreeSearcher>(
-                        Player::Black,
-                        game_mode as u16,
-                        Duration::from_millis(CLI_OPTS.bot_reaction_delay.into()),
-                    ))
-                    .expect("Failed to initialize bot task")
-            };
+            debug!("The Bot will use alpha-beta search");
+            let bot = runtime
+                .block_on(create_bot(
+                    Player::Black,
+                    game_mode as u16,
+                    Duration::from_millis(CLI_OPTS.bot_reaction_delay.into()),
+                ))
+                .expect("Failed to initialize bot task");
 
             runtime.spawn(create_game(
                 (white_update_tx, white_request_rx),
@@ -265,7 +251,7 @@ impl GameScene {
         }
 
         Self {
-            board: Board::default(), // Temporary default (usually stays that but will change when having a custom fen)
+            board: Chess::default(), // Temporary default (usually stays that but will change when having a custom fen)
             first_draw: true,
             game_mode,
             savestate_slot,
@@ -412,15 +398,19 @@ impl GameScene {
                 //
                 // Piece
                 //
-                let piece = self.board.piece_at_sq(*square);
-                if piece != Piece::None {
+                let shakm_sq = ShakmSquare::from_coords(
+                    shakmaty::File::ALL[x],
+                    shakmaty::Rank::ALL[y],
+                );
+                let piece_opt = self.board.board().piece_at(shakm_sq);
+                if let Some(piece) = piece_opt {
                     // Actual piece here
                     let piece_img = if self.pieces_rotated {
                         &self.img_pieces_rotated
                     } else {
                         &self.img_pieces
                     }
-                    .get(&piece.character_lossy())
+                    .get(&piece_to_char(piece))
                     .expect("Failed to find resized piece img!");
                     canvas.draw_image(
                         Point2 {
@@ -436,7 +426,7 @@ impl GameScene {
                 // Overlay
                 //
                 // Overlay image if square is selected
-                if piece != Piece::None
+                if piece_opt.is_some()
                     && self.selected_square.is_some()
                     && self.selected_square.unwrap() == square
                 {
@@ -528,15 +518,16 @@ impl GameScene {
         self.clear_move_hints();
         self.clear_last_moved_hints();
 
-        let sender = match self.board.turn().into() {
+        let current_turn: Player = { let t: Player = self.board.turn().into(); t };
+        let sender = match current_turn {
             Player::Black => self.black_request_sender.clone(),
             Player::White => self.white_request_sender.clone(),
         };
-        let other_player = self.board.turn().other_player();
+        let other_player = current_turn.other_player();
 
         if sender.is_none() {
             self.show_bottom_game_info(
-                GameBottomInfo::Error(format!("You can't move {}", self.board.turn())),
+                GameBottomInfo::Error(format!("You can't move {:?}", current_turn)),
                 None,
                 Some(Duration::from_secs(10)),
             );
@@ -573,15 +564,19 @@ impl GameScene {
     }
 
     fn update_board(&mut self, fen: &str) {
-        if self.board.fen() == fen {
-            debug!("Ignored unchanged board");
-        }
         info!("Updated FEN: {}", fen);
 
-        let new_board = match Board::from_fen(fen) {
-            Ok(board) => board,
+        let parsed: shakmaty::fen::Fen = match fen.parse() {
+            Ok(f) => f,
             Err(e) => {
                 warn!("Failed to parse fen \"{}\". Error: {:?}", fen, e);
+                return;
+            }
+        };
+        let new_board: Chess = match parsed.into_position(shakmaty::CastlingMode::Standard) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("Failed to create position from fen \"{}\". Error: {:?}", fen, e);
                 return;
             }
         };
@@ -589,11 +584,15 @@ impl GameScene {
         // Find updated squares
         for x in 0..8 {
             for y in 0..8 {
-                let sq = to_square(x, y);
-                let old_piece = self.board.piece_at_sq(*sq);
-                let new_piece = new_board.piece_at_sq(*sq);
+                let shakm_sq = ShakmSquare::from_coords(
+                    shakmaty::File::ALL[x],
+                    shakmaty::Rank::ALL[y],
+                );
+                let old_piece = self.board.board().piece_at(shakm_sq);
+                let new_piece = new_board.board().piece_at(shakm_sq);
 
                 if old_piece != new_piece {
+                    let sq = to_square(x, y);
                     self.redraw_squares.insert(sq);
                 }
             }
@@ -685,8 +684,10 @@ impl GameScene {
                                 // Rotate when local player black plays
                                 let should_rotate_pieces = player == Player::Black;
                                 if should_rotate_pieces != self.pieces_rotated {
-                                    for (sq, _) in self.board.get_piece_locations() {
-                                        self.redraw_squares.insert(Square::from(sq));
+                                    for sq in ShakmSquare::ALL {
+                                        if self.board.board().piece_at(sq).is_some() {
+                                            self.redraw_squares.insert(Square::from(sq));
+                                        }
                                     }
                                     self.pieces_rotated = should_rotate_pieces;
                                 }
@@ -733,7 +734,7 @@ impl Scene for GameScene {
                             && Canvas::is_hitting(finger.pos, self.back_button_hitbox.unwrap())
                         {
                             // Save game
-                            let fen = self.board.fen();
+                            let fen = shakmaty::fen::Fen::from_position(&self.board, shakmaty::EnPassantMode::Legal).to_string();
                             let mut savesstates = crate::SAVESTATES.lock().unwrap();
                             match self.savestate_slot {
                                 SavestateSlot::First => savesstates.slot_1 = Some(fen),
@@ -758,7 +759,7 @@ impl Scene for GameScene {
                             let undo_count: u16 = if self.game_mode == GameMode::PvP {
                                 1
                             } else {
-                                if let Player::Black = self.board.turn().into() {
+                                if let Player::Black = { let t: Player = self.board.turn().into(); t } {
                                     1
                                 } else {
                                     2
@@ -777,7 +778,7 @@ impl Scene for GameScene {
                                 }
                             } else {
                                 // Only undo when own turn
-                                match self.board.turn().into() {
+                                match { let t: Player = self.board.turn().into(); t } {
                                     Player::Black => self.black_request_sender.clone(),
                                     Player::White => self.white_request_sender.clone(),
                                 }
@@ -839,8 +840,8 @@ impl Scene for GameScene {
                                                     );
                                                 } else {
                                                     // Select new_square as new selected piece
-                                                    if self.board.piece_at_sq(*new_square)
-                                                        != Piece::None
+                                                    if self.board.board().piece_at(new_square.inner())
+                                                        .is_some()
                                                     {
                                                         self.selected_square = Some(new_square);
                                                         self.redraw_squares
@@ -857,7 +858,7 @@ impl Scene for GameScene {
                                             let finger_down_square = self
                                                 .finger_down_square
                                                 .unwrap_or(new_square.clone());
-                                            if finger_down_square.0 != new_square.0 {
+                                            if finger_down_square.inner() != new_square.inner() {
                                                 // Do immeate move (swiped) without highlighting
 
                                                 self.redraw_squares
@@ -865,8 +866,8 @@ impl Scene for GameScene {
                                                 self.on_user_move(finger_down_square, new_square);
                                             } else {
                                                 // Mark square
-                                                if self.board.piece_at_sq(*new_square)
-                                                    != Piece::None
+                                                if self.board.board().piece_at(new_square.inner())
+                                                    .is_some()
                                                 {
                                                     self.selected_square = Some(new_square);
                                                     self.redraw_squares.insert(new_square.clone());
@@ -1037,7 +1038,7 @@ impl Scene for GameScene {
                     GameBottomInfo::GameEnded(ref short_message) => canvas.draw_text(
                         Point2 {
                             x: None,
-                            y: Some(DISPLAYHEIGHT as i32 - 100),
+                            y: Some(crate::DISPLAY_HEIGHT as i32 - 100),
                         },
                         short_message,
                         100.0,
@@ -1045,7 +1046,7 @@ impl Scene for GameScene {
                     GameBottomInfo::Info(ref message) => canvas.draw_text(
                         Point2 {
                             x: None,
-                            y: Some(DISPLAYHEIGHT as i32 - 20),
+                            y: Some(crate::DISPLAY_HEIGHT as i32 - 20),
                         },
                         message,
                         50.0,
@@ -1053,7 +1054,7 @@ impl Scene for GameScene {
                     GameBottomInfo::Error(ref message) => canvas.draw_text(
                         Point2 {
                             x: Some(5),
-                            y: Some(DISPLAYHEIGHT as i32 - 10),
+                            y: Some(crate::DISPLAY_HEIGHT as i32 - 10),
                         },
                         message,
                         35.0,

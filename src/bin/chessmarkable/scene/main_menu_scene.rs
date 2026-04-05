@@ -1,4 +1,4 @@
-use libremarkable::input::{InputEvent, MultitouchEvent};
+use crate::rmpp_hal::types::{InputEvent, MultitouchEvent};
 use super::Scene;
 use crate::canvas::*;
 
@@ -62,7 +62,7 @@ impl MainMenuScene {
                     y: Some((hitbox.top) as i32),
                 },
                 Vector2 {
-                    x: DISPLAYWIDTH as u32,
+                    x: crate::DISPLAY_WIDTH,
                     y: hitbox.height,
                 },
                 color::WHITE,
