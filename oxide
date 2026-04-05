@@ -1,0 +1,4 @@
+name=chessMarkable
+desc=Chess
+call=/opt/bin/chessmarkable
+imgFile=chessmarkable
