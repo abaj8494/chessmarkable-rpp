@@ -75,8 +75,8 @@ lazy_static! {
 
 pub const REPLAYS_PER_PAGE: u32 = 6;
 
-// RPP DRM display dimensions (LVDS buffer resolution)
-pub const DISPLAY_WIDTH: u32 = 405;
+// RPP physical display dimensions (packed grayscale: DRM 405x1084 @ 32bpp = 1620x1084 pixels)
+pub const DISPLAY_WIDTH: u32 = 1620;
 pub const DISPLAY_HEIGHT: u32 = 1084;
 
 fn main() {

@@ -70,7 +70,7 @@ impl ReplayScene {
         selected_pgn: Option<Pgn>,
     ) -> Self {
         // Size of board
-        let square_size = crate::DISPLAY_WIDTH / 8;
+        let square_size = crate::DISPLAY_WIDTH.min(crate::DISPLAY_HEIGHT) / 8;
         let piece_padding = square_size / 10;
         let overlay_padding = square_size / 20;
 

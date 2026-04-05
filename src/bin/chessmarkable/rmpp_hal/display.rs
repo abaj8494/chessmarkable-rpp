@@ -36,13 +36,22 @@ impl Card {
 
 /// DRM dumb buffer display backend for reMarkable Paper Pro.
 ///
-/// Uses a raw pointer to the mmap'd buffer to avoid self-referential
-/// lifetime issues with DumbMapping<'a>.
+/// The RPP's Gallery 3 e-ink panel uses a packed grayscale format:
+/// each byte of the XRGB8888 DRM buffer represents one physical
+/// grayscale pixel. So a DRM mode of 405x1084 at 32bpp (stride=1620)
+/// actually gives us a 1620x1084 grayscale framebuffer.
 pub struct DrmDisplay {
     card: Card,
-    width: u32,
-    height: u32,
+    /// Physical pixel width (= DRM stride in bytes, typically DRM_width * 4)
+    phys_width: u32,
+    /// Physical pixel height (= DRM mode height)
+    phys_height: u32,
+    /// DRM stride in bytes (= phys_width for packed format)
     stride: u32,
+    /// DRM mode width (for ClipRect calculations)
+    drm_width: u32,
+    /// DRM mode height
+    drm_height: u32,
     fb: control::framebuffer::Handle,
     _crtc: control::crtc::Handle,
     buffer: *mut u8,
@@ -78,10 +87,8 @@ impl DrmDisplay {
             .expect("No display modes available")
             .clone();
 
-        let width = mode.size().0 as u32;
-        let height = mode.size().1 as u32;
-
-        log::info!("DRM display mode: {}x{}", width, height);
+        let drm_width = mode.size().0 as u32;
+        let drm_height = mode.size().1 as u32;
 
         // Find an encoder + CRTC
         let encoder = connector
@@ -97,42 +104,58 @@ impl DrmDisplay {
             .expect("No encoder found");
 
         let crtc_handle = encoder.crtc().unwrap_or_else(|| {
-            // Pick first available CRTC
             *res.crtcs().first().expect("No CRTCs available")
         });
 
         // Create dumb buffer (32bpp XRGB8888)
         let mut db = card
-            .create_dumb_buffer((width, height), drm_fourcc::DrmFourcc::Xrgb8888, 32)
+            .create_dumb_buffer((drm_width, drm_height), drm_fourcc::DrmFourcc::Xrgb8888, 32)
             .expect("Failed to create dumb buffer");
 
         let stride = db.pitch();
-        let buffer_size = db.size().0 as usize * db.size().1 as usize * 4;
-        // Use the actual byte length from stride * height
-        let buffer_byte_size = (stride * height) as usize;
+
+        // RPP packed pixel format: each byte = one grayscale pixel
+        // Physical resolution = stride × drm_height
+        let phys_width = stride;
+        let phys_height = drm_height;
+
+        log::info!(
+            "DRM mode: {}x{}, stride: {}, physical pixels: {}x{}",
+            drm_width, drm_height, stride, phys_width, phys_height
+        );
 
         // Create framebuffer from dumb buffer
         let fb = card
             .add_framebuffer(&db, 24, 32)
             .expect("Failed to add framebuffer");
 
-        // Set CRTC
-        card.set_crtc(
+        // Set CRTC — may fail if another process holds DRM master
+        match card.set_crtc(
             crtc_handle,
             Some(fb),
             (0, 0),
             &[connector.handle()],
             Some(mode),
-        )
-        .expect("Failed to set CRTC");
+        ) {
+            Ok(_) => log::info!("CRTC set successfully"),
+            Err(e) => {
+                log::warn!("set_crtc failed ({}), trying page_flip instead", e);
+                if let Err(e2) = card.page_flip(
+                    crtc_handle,
+                    fb,
+                    drm::control::PageFlipFlags::empty(),
+                    None,
+                ) {
+                    log::warn!("page_flip also failed ({}), display may not update", e2);
+                }
+            }
+        }
 
-        // Map the dumb buffer — get a DumbMapping which derefs to &mut [u8]
+        // Map the dumb buffer
         let mut mapping = card
             .map_dumb_buffer(&mut db)
             .expect("Failed to map dumb buffer");
 
-        // Get a raw pointer to the buffer data so we can store it without
-        // lifetime issues. The buffer stays mapped for the lifetime of DrmDisplay.
         let buffer_ptr = mapping.as_mut().as_mut_ptr();
         let actual_buffer_size = mapping.as_ref().len();
 
@@ -149,9 +172,11 @@ impl DrmDisplay {
 
         let mut display = DrmDisplay {
             card,
-            width,
-            height,
+            phys_width,
+            phys_height,
             stride,
+            drm_width,
+            drm_height,
             fb,
             _crtc: crtc_handle,
             buffer: buffer_ptr,
@@ -163,12 +188,14 @@ impl DrmDisplay {
         display
     }
 
+    /// Logical display width in physical pixels.
     pub fn width(&self) -> u32 {
-        self.width
+        self.phys_width
     }
 
+    /// Logical display height in physical pixels.
     pub fn height(&self) -> u32 {
-        self.height
+        self.phys_height
     }
 
     fn buffer_mut(&mut self) -> &mut [u8] {
@@ -179,73 +206,61 @@ impl DrmDisplay {
         unsafe { std::slice::from_raw_parts(self.buffer, self.buffer_size) }
     }
 
-    /// Set a single pixel at (x, y) to the given grayscale color.
+    /// Set a single physical pixel at (x, y) to the given grayscale color.
+    /// In the RPP packed format, each byte in the buffer is one pixel.
     #[inline]
     fn set_pixel(&mut self, x: u32, y: u32, c: color) {
-        if x >= self.width || y >= self.height {
+        if x >= self.phys_width || y >= self.phys_height {
             return;
         }
-        let offset = (y * self.stride + x * 4) as usize;
+        // Each byte = one grayscale pixel. Row stride = self.stride bytes.
+        let offset = (y * self.stride + x) as usize;
         let buf = self.buffer_mut();
-        if offset + 3 >= buf.len() {
-            return;
+        if offset < buf.len() {
+            buf[offset] = c.as_u8();
         }
-        let gray = c.as_u8();
-        buf[offset] = gray; // B
-        buf[offset + 1] = gray; // G
-        buf[offset + 2] = gray; // R
-        buf[offset + 3] = 0xFF; // X
     }
 
     /// Get a pixel's grayscale value at (x, y).
     #[inline]
     fn get_pixel(&self, x: u32, y: u32) -> u8 {
-        if x >= self.width || y >= self.height {
+        if x >= self.phys_width || y >= self.phys_height {
             return 255;
         }
-        let offset = (y * self.stride + x * 4) as usize;
+        let offset = (y * self.stride + x) as usize;
         let buf = self.buffer_ref();
-        if offset >= buf.len() {
-            return 255;
+        if offset < buf.len() {
+            buf[offset]
+        } else {
+            255
         }
-        buf[offset] // B channel (all channels are the same for grayscale)
     }
 
     pub fn clear(&mut self) {
         let buf = self.buffer_mut();
-        // Fill with white (0xFF for all channels)
-        for chunk in buf.chunks_exact_mut(4) {
-            chunk[0] = 0xFF;
-            chunk[1] = 0xFF;
-            chunk[2] = 0xFF;
-            chunk[3] = 0xFF;
-        }
+        // Fill with white (0xFF)
+        buf.fill(0xFF);
     }
 
     pub fn fill_rect(&mut self, pos: Point2<i32>, size: cgmath::Vector2<u32>, c: color) {
         let x0 = pos.x.max(0) as u32;
         let y0 = pos.y.max(0) as u32;
-        let x1 = (pos.x as u32 + size.x).min(self.width);
-        let y1 = (pos.y as u32 + size.y).min(self.height);
+        let x1 = ((pos.x.max(0) as u32) + size.x).min(self.phys_width);
+        let y1 = ((pos.y.max(0) as u32) + size.y).min(self.phys_height);
         let gray = c.as_u8();
 
+        let stride = self.stride;
+        let buf = self.buffer_mut();
         for y in y0..y1 {
-            let row_offset = (y * self.stride) as usize;
-            let buf = self.buffer_mut();
-            for x in x0..x1 {
-                let offset = row_offset + (x * 4) as usize;
-                if offset + 3 < buf.len() {
-                    buf[offset] = gray;
-                    buf[offset + 1] = gray;
-                    buf[offset + 2] = gray;
-                    buf[offset + 3] = 0xFF;
-                }
+            let row_start = (y * stride + x0) as usize;
+            let row_end = (y * stride + x1) as usize;
+            if row_end <= buf.len() {
+                buf[row_start..row_end].fill(gray);
             }
         }
     }
 
     pub fn draw_line(&mut self, from: Point2<i32>, to: Point2<i32>, width: u32, c: color) {
-        // Bresenham's line algorithm with thickness
         let dx = (to.x - from.x).abs();
         let dy = -(to.y - from.y).abs();
         let sx: i32 = if from.x < to.x { 1 } else { -1 };
@@ -293,43 +308,25 @@ impl DrmDisplay {
         // Top
         self.fill_rect(
             Point2 { x, y },
-            cgmath::Vector2 {
-                x: size.x,
-                y: border_px,
-            },
+            cgmath::Vector2 { x: size.x, y: border_px },
             c,
         );
         // Bottom
         self.fill_rect(
-            Point2 {
-                x,
-                y: y + h - border_px as i32,
-            },
-            cgmath::Vector2 {
-                x: size.x,
-                y: border_px,
-            },
+            Point2 { x, y: y + h - border_px as i32 },
+            cgmath::Vector2 { x: size.x, y: border_px },
             c,
         );
         // Left
         self.fill_rect(
             Point2 { x, y },
-            cgmath::Vector2 {
-                x: border_px,
-                y: size.y,
-            },
+            cgmath::Vector2 { x: border_px, y: size.y },
             c,
         );
         // Right
         self.fill_rect(
-            Point2 {
-                x: x + w - border_px as i32,
-                y,
-            },
-            cgmath::Vector2 {
-                x: border_px,
-                y: size.y,
-            },
+            Point2 { x: x + w - border_px as i32, y },
+            cgmath::Vector2 { x: border_px, y: size.y },
             c,
         );
     }
@@ -340,12 +337,12 @@ impl DrmDisplay {
 
         for iy in 0..img_h {
             let dy = pos.y + iy as i32;
-            if dy < 0 || dy >= self.height as i32 {
+            if dy < 0 || dy >= self.phys_height as i32 {
                 continue;
             }
             for ix in 0..img_w {
                 let dx = pos.x + ix as i32;
-                if dx < 0 || dx >= self.width as i32 {
+                if dx < 0 || dx >= self.phys_width as i32 {
                     continue;
                 }
                 let pixel = img.get_pixel(ix, iy);
@@ -381,7 +378,6 @@ impl DrmDisplay {
         let mut x_offset = 0.0f32;
         let mut max_height = 0u32;
 
-        // Layout all glyphs to get metrics
         let mut glyphs: Vec<(fontdue::Metrics, Vec<u8>, f32)> = Vec::new();
         for ch in text.chars() {
             let (metrics, bitmap) = self.font.rasterize(ch, size);
@@ -392,7 +388,7 @@ impl DrmDisplay {
         }
 
         let total_width = x_offset.ceil() as u32;
-        let total_height = (size * 1.2) as u32; // Approximate line height
+        let total_height = (size * 1.2) as u32;
 
         let rect = mxcfb_rect {
             left: pos.x as u32,
@@ -405,8 +401,7 @@ impl DrmDisplay {
             return rect;
         }
 
-        // Render glyphs
-        let baseline_y = pos.y + size * 0.8; // Approximate baseline
+        let baseline_y = pos.y + size * 0.8;
         let gray = c.as_u8();
 
         for (metrics, bitmap, glyph_x) in &glyphs {
@@ -421,11 +416,13 @@ impl DrmDisplay {
                     }
                     let px = (gx + col as f32) as i32;
                     let py = (gy + row as f32) as i32;
-                    if px < 0 || py < 0 || px >= self.width as i32 || py >= self.height as i32 {
+                    if px < 0 || py < 0
+                        || px >= self.phys_width as i32
+                        || py >= self.phys_height as i32
+                    {
                         continue;
                     }
 
-                    // Alpha blend with background
                     let bg = self.get_pixel(px as u32, py as u32);
                     let a = alpha as f32 / 255.0;
                     let blended = (gray as f32 * a + bg as f32 * (1.0 - a)) as u8;
@@ -437,21 +434,28 @@ impl DrmDisplay {
         rect
     }
 
+    /// Convert physical pixel x coordinate to DRM ClipRect coordinate.
+    /// In packed format, 4 physical pixels = 1 DRM pixel.
+    #[inline]
+    fn phys_to_drm_x(&self, x: u32) -> u16 {
+        (x / 4).min(self.drm_width) as u16
+    }
+
     /// Trigger a full display refresh via DRM dirty FB ioctl.
     pub fn full_refresh(&self) -> u32 {
-        let clip = ClipRect::new(0, 0, self.width as u16, self.height as u16);
+        let clip = ClipRect::new(0, 0, self.drm_width as u16, self.drm_height as u16);
         let _ = self.card.dirty_framebuffer(self.fb, &[clip]);
         0
     }
 
     /// Trigger a partial display refresh for a given region.
+    /// Region coordinates are in physical pixels; we convert to DRM pixel coords.
     pub fn partial_refresh(&self, region: &mxcfb_rect) -> u32 {
-        let clip = ClipRect::new(
-            region.left as u16,
-            region.top as u16,
-            (region.left + region.width).min(self.width) as u16,
-            (region.top + region.height).min(self.height) as u16,
-        );
+        let x1 = self.phys_to_drm_x(region.left);
+        let y1 = region.top.min(self.drm_height) as u16;
+        let x2 = self.phys_to_drm_x(region.left + region.width);
+        let y2 = (region.top + region.height).min(self.drm_height) as u16;
+        let clip = ClipRect::new(x1, y1, x2, y2);
         let _ = self.card.dirty_framebuffer(self.fb, &[clip]);
         0
     }
