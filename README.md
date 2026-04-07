@@ -1,71 +1,85 @@
-# chessMarkable
+# chessMarkable RPP
 
-[![rm1](https://img.shields.io/badge/rM1-supported-green)](https://remarkable.com/store/remarkable)
-[![rm2](https://img.shields.io/badge/rM2-supported-green)](https://remarkable.com/store/remarkable-2)
-[![opkg](https://img.shields.io/badge/OPKG-chessmarkable-blue)](https://github.com/toltec-dev/toltec)
-[![launchers](https://img.shields.io/badge/Launchers-supported-green)](https://github.com/reHackable/awesome-reMarkable#launchers)
-[![Mentioned in Awesome reMarkable](https://awesome.re/mentioned-badge.svg)](https://github.com/reHackable/awesome-reMarkable)
+[![rMPP](https://img.shields.io/badge/rMPP-supported-green)](https://remarkable.com/store/remarkable-paper-pro)
+[![AppLoad](https://img.shields.io/badge/AppLoad-compatible-blue)](https://github.com/pFeurle/AppLoad)
 
-A chess game for the reMarkable tablet writting using the [pleco](https://crates.io/crates/pleco) chess library which is a port of [Stockfish](https://stockfishchess.org/).
+A chess game for the **reMarkable Paper Pro**, ported from [LinusCDE/chessmarkable](https://github.com/LinusCDE/chessmarkable). Features color board rendering on the Gallery 3 e-ink display, pawn promotion UI, and PGN viewer.
 
-<img src="https://transfer.cosmos-ink.net/SF/mainmenu.png" width="30%">&nbsp;<img src="https://transfer.cosmos-ink.net/1tRXA8n/pgnselect.png" width="30%">&nbsp;<img src="https://transfer.cosmos-ink.net/LZ9QT/3.jpg" width="30%">
+This port replaces the original `libremarkable` framebuffer backend with [QTFB](https://github.com/AnotherStranger/qtfb-client) (shared-memory display protocol) and swaps `pleco` (x86-only) for [shakmaty](https://crates.io/crates/shakmaty) (pure Rust, aarch64 compatible).
+
+## Features
+
+- **Color chess board** — warm tan/brown squares using the RPP's Gallery 3 color e-ink
+- **Pawn promotion UI** — modal overlay to choose Queen, Rook, Bishop, or Knight
+- **Player vs Player** with optional board rotation
+- **Player vs Bot** at Easy, Normal, and Hard difficulty
+- **PGN Viewer** — load and step through PGN files
+- **Save/resume** — game state persisted across sessions
+- **Streak-free display** — QTFB handles proper e-ink waveform selection (GC16/DU)
 
 ## Controlling
-A chess piece can be moved in two ways:
 
-1. Clicking it once and clicking the spot it's supposed to
-2. Clicking it and moving the finger onto the square to move it there on release
+Move a chess piece by either:
 
-The second method has the advantage that it doesn't highlight the chess piece or shows the possible moves.
+1. Tap it once, then tap the destination square
+2. Tap and drag to the destination square (doesn't show move hints)
 
-## FEN
+## Installation via AppLoad
 
-When running the Game with the enviroment variable `RUST_LOG` set to `debug`, the [FEN](https://en.wikipedia.org/wiki/Forsyth%E2%80%93Edwards_Notation) of a board will be output on each move. This is useful for debugging but also for manually saving a game state or resuming it elsewhere since this notation should be compatible with other chess programs/engines.
+1. Copy the `appload/` directory contents to `/home/root/xovi/exthome/appload/chessmarkable/` on the device
+2. Copy the built binary as `chessmarkable` into that directory
+3. Copy `icon.png` into that directory
+4. Restart AppLoad — the app should appear in the launcher
 
-When starting a game, you'll need to specifiy a slot to play on. On quitting the game, the FEN will get saved to `~/.config/chessmarkable/savestates.yml` which can be used to resume from.
+The directory should contain:
+```
+/home/root/xovi/exthome/appload/chessmarkable/
+  chessmarkable            # binary
+  icon.png                 # app icon
+  external.manifest.json   # AppLoad manifest
+```
 
-(The `-i` option was removed in favor to add your own fen to the above file).
+## Building from Source
+
+Requires [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) for cross-compilation:
+
+```bash
+cargo install cargo-zigbuild
+cargo zigbuild --release --target aarch64-unknown-linux-musl
+```
+
+The resulting static binary is at `target/aarch64-unknown-linux-musl/release/chessmarkable`.
+
+Deploy to the device:
+
+```bash
+scp target/aarch64-unknown-linux-musl/release/chessmarkable \
+    root@<device-ip>:/home/root/xovi/exthome/appload/chessmarkable/chessmarkable
+```
 
 ## PGN Viewer
 
-Chessmarkable also includes a PGN Player (huge thanks to [@rmadhwal](https://github.com/rmadhwal), for contributing this feature)!
+Place PGN files in `~/.config/chessmarkable/pgn/` on the device. Browse and step through games from the "PGN Viewer" menu.
 
-You can put downloaded PGN Files into the directory `~/.config/chessmarkable/pgn` on the device with software like scp, FileZilla or WinSCP.
-After this, you should be able to browse all the games from the menu point "PGN Viewer" and step through all the games.
+## FEN Debugging
 
-## Installation
+Set `RUST_LOG=debug` to print FEN notation on each move. Game state is saved to `~/.config/chessmarkable/savestates.yml`.
 
-### Prebuilt binary/program
+## Key Changes from Original
 
-- Go the the [releases page](https://github.com/LinusCDE/chessmarkable/releases)
-- Get the newest released binary file (the one without any extension) and copy it onto your remarkable, using e.g. FileZilla, WinSCP or scp.
-- SSH into your remarkable and mark the file as executable with `chmod +x chess`
-- Stop xochitl (the interface) with `systemctl stop xochitl`
-- Start the game with `./chessmarkable` (or whatever the binary is called now)
-- After you're done, restart xochitl with `systemctl start xochitl`
-
-### Compiling
-
-In general building should work on most toolchains. You generally wanna target armv7-unknown-linux-gnueabihf for any remarkable.
-But as with all things in life, stuff never works great on every setup.
-
-That's why I recommend to nowadays build with the rust image from [toltec-dev/toolchain](https://github.com/toltec-dev/toolchain). It is the most modern and the closest to the actual reMarkable system as you're gonna get as of now.
-
-To make it easier to use, I found that you can use the rust image (`ghcr.io/toltec-dev/rust:v3.2`, [all versions](https://github.com/toltec-dev/toolchain/pkgs/container/rust)).
-This is done using the `Cross.toml` file. So you should just need to run `cross build --target=armv7-unknown-linux-gnueabihf --release` and it will use the above image (or possibly newer if this readme gets out-of-date).
-
-## Todo
-
-- Proper own icon(s)
-- Clean the code
-
-## reMarkable 2 support
-
-This app cant actually drive the rM 2 framebuffer. It needs [rm2fb](https://github.com/ddvk/remarkable2-framebuffer/) for that.
-
-If you execute chessmarkable from ssh, be sure to have followed rm2fb steps to enable the support. When installed running `rm2fb-client ./chessmarkable` should work as well. Launching through a launcher (from toltec) should just work.
+| Area | Original (rM1/rM2) | This Port (rMPP) |
+|------|-------------------|-------------------|
+| Display | `libremarkable` framebuffer | QTFB shared-memory protocol |
+| Chess engine | `pleco` (x86 Stockfish port) | `shakmaty` (pure Rust) |
+| Architecture | armv7 (gnueabihf) | aarch64 (musl, static) |
+| Colors | Grayscale only | RGB color board |
+| Pawn promotion | Auto-promoted to knight | Interactive piece selection |
+| Launcher | Toltec/Oxide | AppLoad |
 
 ## Credit
 
-- The [pleco](https://crates.io/crates/pleco) library is used as the engine, checking valid moves and providing the bots
-- The chess pices are from [pixabay here](https://pixabay.com/vectors/chess-pieces-set-symbols-game-26774/)
+- [LinusCDE/chessmarkable](https://github.com/LinusCDE/chessmarkable) — original reMarkable chess game
+- [shakmaty](https://crates.io/crates/shakmaty) — chess move generation and validation
+- [chess_pgn_parser](https://crates.io/crates/chess_pgn_parser) — PGN parsing
+- Chess pieces from [Pixabay](https://pixabay.com/vectors/chess-pieces-set-symbols-game-26774/)
+- QTFB protocol documentation from [AnotherStranger/qtfb-client](https://github.com/AnotherStranger/qtfb-client)
