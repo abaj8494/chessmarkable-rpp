@@ -1,190 +1,124 @@
+use super::display::{INPUT_TOUCH_PRESS, INPUT_TOUCH_RELEASE, INPUT_TOUCH_UPDATE, MESSAGE_USERINPUT};
 use super::types::{Finger, InputEvent, MultitouchEvent};
 use cgmath::Point2;
-use std::fs::File;
-use std::io::Read;
+use std::os::unix::io::RawFd;
 use std::sync::mpsc::Sender;
 use std::thread;
 
-// Linux input event constants
-const EV_SYN: u16 = 0x00;
-const EV_ABS: u16 = 0x03;
-const SYN_REPORT: u16 = 0x00;
-const ABS_MT_SLOT: u16 = 0x2f;
-const ABS_MT_TRACKING_ID: u16 = 0x39;
-const ABS_MT_POSITION_X: u16 = 0x35;
-const ABS_MT_POSITION_Y: u16 = 0x36;
+/// QTFB ServerMessage layout for input events.
+///
+/// The server sends messages where byte 0 is the type. For input events
+/// (type=4), the payload starts at offset 4 (after 3 bytes padding):
+///   offset 4:  inputType (i32)
+///   offset 8:  devId     (i32)
+///   offset 12: x         (i32)
+///   offset 16: y         (i32)
+///   offset 20: d         (i32)
+///
+/// Note: the init response has different layout due to size_t alignment,
+/// but we only parse input events here.
+const MSG_BUF_SIZE: usize = 64;
 
-// Touch input device path on RPP
-const TOUCH_DEVICE: &str = "/dev/input/event3";
-
-// Raw input_event struct (matches kernel struct input_event for aarch64)
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
-struct InputEventRaw {
-    tv_sec: i64,
-    tv_usec: i64,
-    type_: u16,
-    code: u16,
-    value: i32,
-}
-
-const INPUT_EVENT_SIZE: usize = std::mem::size_of::<InputEventRaw>();
-
-/// Maximum number of simultaneous touch slots
-const MAX_SLOTS: usize = 10;
-
-#[derive(Clone, Debug, Default)]
-struct TouchSlot {
-    tracking_id: i32,
-    x: i32,
-    y: i32,
-    active: bool,
-    changed: bool,
-}
-
-/// Query the absinfo for an axis to get min/max range.
-/// Falls back to reasonable defaults if ioctl fails.
-fn get_abs_range(fd: i32, axis: u16) -> (i32, i32) {
-    #[repr(C)]
-    #[derive(Default)]
-    struct AbsInfo {
-        value: i32,
-        minimum: i32,
-        maximum: i32,
-        fuzz: i32,
-        flat: i32,
-        resolution: i32,
-    }
-
-    // EVIOCGABS ioctl number: _IOR('E', 0x40 + axis, struct input_absinfo)
-    // For aarch64: direction=2 (read), size=24, type='E'=0x45, nr=0x40+axis
-    let size = std::mem::size_of::<AbsInfo>() as u64;
-    let nr = 0x40u64 + axis as u64;
-    let ioctl_num: u64 = (2u64 << 30) | (size << 16) | (0x45u64 << 8) | nr;
-
-    let mut info = AbsInfo::default();
-    let ret = unsafe {
-        libc::ioctl(fd, ioctl_num as libc::c_ulong as libc::Ioctl, &mut info as *mut AbsInfo)
-    };
-
-    if ret < 0 {
-        log::warn!("Failed to get absinfo for axis {}, using defaults", axis);
-        (0, 4096) // Reasonable default for touch input
-    } else {
-        (info.minimum, info.maximum)
-    }
-}
-
-/// Start input reader thread for touch events.
-pub fn start_input_threads(tx: Sender<InputEvent>, display_width: u32, display_height: u32) {
+/// Start a thread that receives QTFB input events from the socket
+/// and translates them to our InputEvent type.
+pub fn start_input_threads(tx: Sender<InputEvent>, qtfb_fd: RawFd) {
     thread::spawn(move || {
-        let mut file = match File::open(TOUCH_DEVICE) {
-            Ok(f) => f,
-            Err(e) => {
-                log::error!("Failed to open touch device {}: {}", TOUCH_DEVICE, e);
-                return;
-            }
-        };
+        log::info!("QTFB input thread started on fd {}", qtfb_fd);
 
-        // Get touch coordinate ranges for scaling
-        use std::os::unix::io::AsRawFd;
-        let fd = file.as_raw_fd();
-        let (x_min, x_max) = get_abs_range(fd, ABS_MT_POSITION_X);
-        let (y_min, y_max) = get_abs_range(fd, ABS_MT_POSITION_Y);
-        log::info!(
-            "Touch range: X={}..{}, Y={}..{}, display={}x{}",
-            x_min, x_max, y_min, y_max, display_width, display_height
-        );
+        let mut buf = [0u8; MSG_BUF_SIZE];
+        let mut last_tracking_id: i32 = 0;
 
-        let x_range = (x_max - x_min) as f64;
-        let y_range = (y_max - y_min) as f64;
-
-        let mut slots = vec![TouchSlot::default(); MAX_SLOTS];
-        for slot in &mut slots {
-            slot.tracking_id = -1;
-        }
-        let mut current_slot: usize = 0;
-
-        let mut buf = [0u8; INPUT_EVENT_SIZE];
         loop {
-            match file.read_exact(&mut buf) {
-                Ok(()) => {}
-                Err(e) => {
-                    log::error!("Error reading touch device: {}", e);
-                    break;
+            let n = unsafe {
+                libc::recv(
+                    qtfb_fd,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                    0,
+                )
+            };
+
+            if n <= 0 {
+                if n == 0 {
+                    log::info!("QTFB socket closed");
+                } else {
+                    log::error!(
+                        "QTFB recv error: {}",
+                        std::io::Error::last_os_error()
+                    );
                 }
+                break;
             }
 
-            let event: InputEventRaw = unsafe { std::ptr::read(buf.as_ptr() as *const _) };
+            let msg_type = buf[0];
+            if msg_type != MESSAGE_USERINPUT {
+                continue;
+            }
 
-            match event.type_ {
-                EV_ABS => match event.code {
-                    ABS_MT_SLOT => {
-                        current_slot = event.value as usize;
-                        if current_slot >= MAX_SLOTS {
-                            current_slot = 0;
-                        }
-                    }
-                    ABS_MT_TRACKING_ID => {
-                        let slot = &mut slots[current_slot];
-                        if event.value == -1 {
-                            // Finger lifted
-                            slot.active = false;
-                            slot.changed = true;
-                        } else {
-                            // New finger
-                            slot.tracking_id = event.value;
-                            slot.active = true;
-                            slot.changed = true;
-                        }
-                    }
-                    ABS_MT_POSITION_X => {
-                        slots[current_slot].x = event.value;
-                        slots[current_slot].changed = true;
-                    }
-                    ABS_MT_POSITION_Y => {
-                        slots[current_slot].y = event.value;
-                        slots[current_slot].changed = true;
-                    }
-                    _ => {}
+            // Parse input event fields from known offsets.
+            // On aarch64 with repr(C), the union in ServerMessage starts at
+            // offset 4 (u8 + 3 bytes padding to align i32).
+            // UserInputContents: { inputType: i32, devId: i32, x: i32, y: i32, d: i32 }
+            // But actually with size_t in the init variant, the union may start
+            // at offset 8. Let's handle both by checking the received size.
+            //
+            // The safest approach: the union alignment is driven by size_t (8 bytes)
+            // on aarch64, so the union starts at offset 8.
+            let offset = if n >= 28 { 8usize } else { 4usize };
+
+            let input_type = i32::from_ne_bytes([
+                buf[offset],
+                buf[offset + 1],
+                buf[offset + 2],
+                buf[offset + 3],
+            ]);
+            // devId at offset+4 (skip it)
+            let x = i32::from_ne_bytes([
+                buf[offset + 8],
+                buf[offset + 9],
+                buf[offset + 10],
+                buf[offset + 11],
+            ]);
+            let y = i32::from_ne_bytes([
+                buf[offset + 12],
+                buf[offset + 13],
+                buf[offset + 14],
+                buf[offset + 15],
+            ]);
+
+            let finger = Finger {
+                pos: Point2 {
+                    x: x.max(0) as u16,
+                    y: y.max(0) as u16,
                 },
-                EV_SYN if event.code == SYN_REPORT => {
-                    // Emit events for changed slots
-                    for slot in slots.iter_mut() {
-                        if !slot.changed {
-                            continue;
-                        }
-                        slot.changed = false;
+                tracking_id: last_tracking_id,
+            };
 
-                        // Scale raw coordinates to display pixels
-                        let scaled_x =
-                            ((slot.x - x_min) as f64 / x_range * display_width as f64) as u16;
-                        let scaled_y =
-                            ((slot.y - y_min) as f64 / y_range * display_height as f64) as u16;
-
-                        let finger = Finger {
-                            pos: Point2 {
-                                x: scaled_x,
-                                y: scaled_y,
-                            },
-                            tracking_id: slot.tracking_id,
-                        };
-
-                        let event = if !slot.active {
-                            InputEvent::MultitouchEvent {
-                                event: MultitouchEvent::Release { finger },
-                            }
-                        } else {
-                            InputEvent::MultitouchEvent {
-                                event: MultitouchEvent::Press { finger },
-                            }
-                        };
-
-                        let _ = tx.send(event);
-                    }
+            let event = match input_type {
+                t if t == INPUT_TOUCH_PRESS => {
+                    last_tracking_id += 1;
+                    let finger = Finger {
+                        tracking_id: last_tracking_id,
+                        ..finger
+                    };
+                    Some(InputEvent::MultitouchEvent {
+                        event: MultitouchEvent::Press { finger },
+                    })
                 }
-                _ => {}
+                t if t == INPUT_TOUCH_RELEASE => Some(InputEvent::MultitouchEvent {
+                    event: MultitouchEvent::Release { finger },
+                }),
+                t if t == INPUT_TOUCH_UPDATE => Some(InputEvent::MultitouchEvent {
+                    event: MultitouchEvent::Move { finger },
+                }),
+                _ => None,
+            };
+
+            if let Some(ev) = event {
+                let _ = tx.send(ev);
             }
         }
+
+        log::info!("QTFB input thread exiting");
     });
 }

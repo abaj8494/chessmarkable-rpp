@@ -75,9 +75,9 @@ lazy_static! {
 
 pub const REPLAYS_PER_PAGE: u32 = 6;
 
-// RPP physical display dimensions (packed grayscale: DRM 405x1084 @ 32bpp = 1620x1084 pixels)
+// RPP display dimensions via QTFB (full native resolution)
 pub const DISPLAY_WIDTH: u32 = 1620;
-pub const DISPLAY_HEIGHT: u32 = 1084;
+pub const DISPLAY_HEIGHT: u32 = 2160;
 
 fn main() {
     let show_log_info = if env::var("RUST_LOG").is_err() {
@@ -127,9 +127,10 @@ fn main() {
     let mut canvas = Canvas::new();
 
     let (input_tx, input_rx) = std::sync::mpsc::channel::<InputEvent>();
-    start_input_threads(input_tx, canvas.display_width(), canvas.display_height());
+    start_input_threads(input_tx, canvas.qtfb_fd());
 
-    const FPS: u16 = 30;
+    // E-ink displays can't do high FPS; keep it low to reduce ghosting
+    const FPS: u16 = 10;
     const FRAME_DURATION: Duration = Duration::from_millis(1000 / FPS as u64);
 
     let mut current_scene: Box<dyn Scene> =

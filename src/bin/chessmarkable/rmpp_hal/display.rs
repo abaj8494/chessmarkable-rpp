@@ -1,201 +1,283 @@
 use super::types::{color, mxcfb_rect};
 use cgmath::Point2;
-use drm::buffer::Buffer;
-use drm::control::connector::State as ConnectorState;
-use drm::control::{self, ClipRect, Device as ControlDevice};
-use drm::Device;
 use image::RgbImage;
-use std::fs::{File, OpenOptions};
-use std::os::unix::io::{AsFd, BorrowedFd};
+use std::os::unix::io::RawFd;
 
 // Embed font for text rendering
 const FONT_DATA: &[u8] = include_bytes!("../../../../res/NotoSans-Regular.ttf");
 
-/// DRM card file wrapper implementing the drm traits.
-struct Card(File);
+// QTFB protocol constants
+const SOCKET_PATH: &[u8] = b"/tmp/qtfb.sock\0";
+const DEFAULT_FB_KEY: u32 = 245209899;
 
-impl AsFd for Card {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.0.as_fd()
-    }
+const MESSAGE_INITIALIZE: u8 = 0;
+const MESSAGE_UPDATE: u8 = 1;
+const MESSAGE_SET_REFRESH_MODE: u8 = 5;
+const MESSAGE_REQUEST_FULL_REFRESH: u8 = 6;
+
+const UPDATE_ALL: i32 = 0;
+const UPDATE_PARTIAL: i32 = 1;
+
+const FBFMT_RMPP_RGB888: u8 = 1;
+
+const REFRESH_MODE_FAST: i32 = 1;
+const REFRESH_MODE_CONTENT: i32 = 3;
+#[allow(dead_code)]
+const REFRESH_MODE_UI: i32 = 4;
+
+pub const RMPP_WIDTH: u32 = 1620;
+pub const RMPP_HEIGHT: u32 = 2160;
+
+// QTFB input event constants (for input.rs)
+pub const MESSAGE_USERINPUT: u8 = 4;
+pub const INPUT_TOUCH_PRESS: i32 = 0x10;
+pub const INPUT_TOUCH_RELEASE: i32 = 0x11;
+pub const INPUT_TOUCH_UPDATE: i32 = 0x12;
+
+// ---- repr(C) message structs matching QTFB C++ layout ----
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct InitContents {
+    framebuffer_key: u32,
+    framebuffer_type: u8,
 }
 
-impl Device for Card {}
-impl ControlDevice for Card {}
-
-impl Card {
-    fn open(path: &str) -> Self {
-        let f = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .expect(&format!("Failed to open DRM device: {}", path));
-        Card(f)
-    }
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct UpdateContents {
+    msg_type: i32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
 }
 
-/// DRM dumb buffer display backend for reMarkable Paper Pro.
+#[repr(C)]
+union ClientMessageBody {
+    init: InitContents,
+    update: UpdateContents,
+    refresh_mode: i32,
+}
+
+#[repr(C)]
+struct ClientMessage {
+    msg_type: u8,
+    body: ClientMessageBody,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct InitResponseBody {
+    shm_key_defined: i32,
+    shm_size: usize,
+}
+
+#[repr(C)]
+struct ServerMessage {
+    msg_type: u8,
+    init: InitResponseBody,
+}
+
+/// QTFB shared-memory display backend for reMarkable Paper Pro.
 ///
-/// The RPP's Gallery 3 e-ink panel uses a packed grayscale format:
-/// each byte of the XRGB8888 DRM buffer represents one physical
-/// grayscale pixel. So a DRM mode of 405x1084 at 32bpp (stride=1620)
-/// actually gives us a 1620x1084 grayscale framebuffer.
-pub struct DrmDisplay {
-    card: Card,
-    /// Physical pixel width (= DRM stride in bytes, typically DRM_width * 4)
-    phys_width: u32,
-    /// Physical pixel height (= DRM mode height)
-    phys_height: u32,
-    /// DRM stride in bytes (= phys_width for packed format)
-    stride: u32,
-    /// DRM mode width (for ClipRect calculations)
-    drm_width: u32,
-    /// DRM mode height
-    drm_height: u32,
-    fb: control::framebuffer::Handle,
-    _crtc: control::crtc::Handle,
+/// Renders to a shared memory framebuffer (RGB888, 1620x2160) and
+/// signals xochitl via the QTFB Unix socket to refresh the e-ink
+/// panel with proper waveform modes.
+pub struct QtfbDisplay {
+    fd: RawFd,
     buffer: *mut u8,
     buffer_size: usize,
+    width: u32,
+    height: u32,
+    bpp: u32,
     font: fontdue::Font,
 }
 
-// Safety: the mmap'd buffer is only accessed from one thread at a time
-// through &mut self methods.
-unsafe impl Send for DrmDisplay {}
+unsafe impl Send for QtfbDisplay {}
 
-impl DrmDisplay {
+impl QtfbDisplay {
     pub fn new() -> Self {
-        let card = Card::open("/dev/dri/card0");
+        let fb_key = std::env::var("QTFB_KEY")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(DEFAULT_FB_KEY);
 
-        // Get resources
-        let res = card
-            .resource_handles()
-            .expect("Failed to get DRM resources");
+        log::info!("Connecting to QTFB socket with key {}", fb_key);
 
-        // Find a connected connector
-        let connector = res
-            .connectors()
-            .iter()
-            .map(|&c| card.get_connector(c, false).unwrap())
-            .find(|c| c.state() == ConnectorState::Connected)
-            .expect("No connected DRM connector found");
-
-        // Get preferred mode
-        let mode = connector
-            .modes()
-            .first()
-            .expect("No display modes available")
-            .clone();
-
-        let drm_width = mode.size().0 as u32;
-        let drm_height = mode.size().1 as u32;
-
-        // Find an encoder + CRTC
-        let encoder = connector
-            .current_encoder()
-            .and_then(|e| card.get_encoder(e).ok())
-            .or_else(|| {
-                connector
-                    .encoders()
-                    .iter()
-                    .filter_map(|&e| card.get_encoder(e).ok())
-                    .next()
-            })
-            .expect("No encoder found");
-
-        let crtc_handle = encoder.crtc().unwrap_or_else(|| {
-            *res.crtcs().first().expect("No CRTCs available")
-        });
-
-        // Create dumb buffer (32bpp XRGB8888)
-        let mut db = card
-            .create_dumb_buffer((drm_width, drm_height), drm_fourcc::DrmFourcc::Xrgb8888, 32)
-            .expect("Failed to create dumb buffer");
-
-        let stride = db.pitch();
-
-        // RPP packed pixel format: each byte = one grayscale pixel
-        // Physical resolution = stride × drm_height
-        let phys_width = stride;
-        let phys_height = drm_height;
-
-        log::info!(
-            "DRM mode: {}x{}, stride: {}, physical pixels: {}x{}",
-            drm_width, drm_height, stride, phys_width, phys_height
-        );
-
-        // Create framebuffer from dumb buffer
-        let fb = card
-            .add_framebuffer(&db, 24, 32)
-            .expect("Failed to add framebuffer");
-
-        // Set CRTC — may fail if another process holds DRM master
-        match card.set_crtc(
-            crtc_handle,
-            Some(fb),
-            (0, 0),
-            &[connector.handle()],
-            Some(mode),
-        ) {
-            Ok(_) => log::info!("CRTC set successfully"),
-            Err(e) => {
-                log::warn!("set_crtc failed ({}), trying page_flip instead", e);
-                if let Err(e2) = card.page_flip(
-                    crtc_handle,
-                    fb,
-                    drm::control::PageFlipFlags::empty(),
-                    None,
-                ) {
-                    log::warn!("page_flip also failed ({}), display may not update", e2);
-                }
-            }
+        // Create UNIX SEQPACKET socket
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0) };
+        if fd < 0 {
+            panic!(
+                "Failed to create QTFB socket: {}",
+                std::io::Error::last_os_error()
+            );
         }
 
-        // Map the dumb buffer
-        let mut mapping = card
-            .map_dumb_buffer(&mut db)
-            .expect("Failed to map dumb buffer");
+        // Connect to QTFB server
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                SOCKET_PATH.as_ptr(),
+                addr.sun_path.as_mut_ptr() as *mut u8,
+                SOCKET_PATH.len(),
+            );
+        }
 
-        let buffer_ptr = mapping.as_mut().as_mut_ptr();
-        let actual_buffer_size = mapping.as_ref().len();
+        let ret = unsafe {
+            libc::connect(
+                fd,
+                &addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            panic!(
+                "Failed to connect to QTFB at /tmp/qtfb.sock: {}. Is AppLoad installed and xochitl running?",
+                std::io::Error::last_os_error()
+            );
+        }
+        log::info!("Connected to QTFB socket");
 
-        // Leak the mapping so the mmap stays alive
-        std::mem::forget(mapping);
-        std::mem::forget(db);
+        // Send init message (RGB888 format, 1620x2160)
+        let init_msg = ClientMessage {
+            msg_type: MESSAGE_INITIALIZE,
+            body: ClientMessageBody {
+                init: InitContents {
+                    framebuffer_key: fb_key,
+                    framebuffer_type: FBFMT_RMPP_RGB888,
+                },
+            },
+        };
+
+        let sent = unsafe {
+            libc::send(
+                fd,
+                &init_msg as *const _ as *const libc::c_void,
+                std::mem::size_of::<ClientMessage>(),
+                0,
+            )
+        };
+        if sent < 0 {
+            panic!(
+                "Failed to send QTFB init: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        // Receive init response with SHM key and size
+        let mut server_msg: ServerMessage = unsafe { std::mem::zeroed() };
+        let received = unsafe {
+            libc::recv(
+                fd,
+                &mut server_msg as *mut _ as *mut libc::c_void,
+                std::mem::size_of::<ServerMessage>(),
+                0,
+            )
+        };
+        if received < 1 {
+            panic!(
+                "Failed to receive QTFB init response: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        let shm_key = server_msg.init.shm_key_defined;
+        let shm_size = server_msg.init.shm_size;
+        log::info!(
+            "QTFB SHM key: {}, size: {} bytes ({}x{} RGB888 = {})",
+            shm_key,
+            shm_size,
+            RMPP_WIDTH,
+            RMPP_HEIGHT,
+            RMPP_WIDTH as usize * RMPP_HEIGHT as usize * 3
+        );
+
+        // Open and mmap the shared memory
+        let shm_path = format!("/dev/shm/qtfb_{}", shm_key);
+        let shm_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&shm_path)
+            .unwrap_or_else(|e| panic!("Failed to open SHM at {}: {}", shm_path, e));
+
+        use std::os::unix::io::AsRawFd;
+        let shm_fd = shm_file.as_raw_fd();
+
+        let shm_ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                shm_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                shm_fd,
+                0,
+            )
+        };
+        if shm_ptr == libc::MAP_FAILED {
+            panic!(
+                "Failed to mmap QTFB SHM: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        // Keep the file open (forget it so it doesn't close the fd)
+        std::mem::forget(shm_file);
 
         // Load font
-        let font = fontdue::Font::from_bytes(
-            FONT_DATA,
-            fontdue::FontSettings::default(),
-        )
-        .expect("Failed to load embedded font");
+        let font = fontdue::Font::from_bytes(FONT_DATA, fontdue::FontSettings::default())
+            .expect("Failed to load embedded font");
 
-        let mut display = DrmDisplay {
-            card,
-            phys_width,
-            phys_height,
-            stride,
-            drm_width,
-            drm_height,
-            fb,
-            _crtc: crtc_handle,
-            buffer: buffer_ptr,
-            buffer_size: actual_buffer_size,
+        // Set refresh mode to CONTENT (GC16) for clean grayscale rendering
+        let mode_msg = ClientMessage {
+            msg_type: MESSAGE_SET_REFRESH_MODE,
+            body: ClientMessageBody {
+                refresh_mode: REFRESH_MODE_CONTENT,
+            },
+        };
+        unsafe {
+            libc::send(
+                fd,
+                &mode_msg as *const _ as *const libc::c_void,
+                std::mem::size_of::<ClientMessage>(),
+                0,
+            );
+        }
+
+        let mut display = QtfbDisplay {
+            fd,
+            buffer: shm_ptr as *mut u8,
+            buffer_size: shm_size,
+            width: RMPP_WIDTH,
+            height: RMPP_HEIGHT,
+            bpp: 3, // RGB888
             font,
         };
 
         display.clear();
+        display.full_refresh();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        log::info!(
+            "QTFB display initialized: {}x{} RGB888",
+            RMPP_WIDTH,
+            RMPP_HEIGHT
+        );
         display
     }
 
-    /// Logical display width in physical pixels.
-    pub fn width(&self) -> u32 {
-        self.phys_width
+    /// Return the QTFB socket fd for the input thread to recv events.
+    pub fn socket_fd(&self) -> RawFd {
+        self.fd
     }
 
-    /// Logical display height in physical pixels.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
     pub fn height(&self) -> u32 {
-        self.phys_height
+        self.height
     }
 
     fn buffer_mut(&mut self) -> &mut [u8] {
@@ -206,56 +288,70 @@ impl DrmDisplay {
         unsafe { std::slice::from_raw_parts(self.buffer, self.buffer_size) }
     }
 
-    /// Set a single physical pixel at (x, y) to the given grayscale color.
-    /// In the RPP packed format, each byte in the buffer is one pixel.
+    /// Stride in bytes (width * bytes_per_pixel).
+    #[inline]
+    fn stride(&self) -> u32 {
+        self.width * self.bpp
+    }
+
+    /// Set a single pixel to the given grayscale color.
+    /// RGB888: write gray value to R, G, B channels.
     #[inline]
     fn set_pixel(&mut self, x: u32, y: u32, c: color) {
-        if x >= self.phys_width || y >= self.phys_height {
+        if x >= self.width || y >= self.height {
             return;
         }
-        // Each byte = one grayscale pixel. Row stride = self.stride bytes.
-        let offset = (y * self.stride + x) as usize;
+        let offset = (y * self.stride() + x * self.bpp) as usize;
+        let gray = c.as_u8();
         let buf = self.buffer_mut();
-        if offset < buf.len() {
-            buf[offset] = c.as_u8();
+        if offset + 2 < buf.len() {
+            buf[offset] = gray;
+            buf[offset + 1] = gray;
+            buf[offset + 2] = gray;
         }
     }
 
-    /// Get a pixel's grayscale value at (x, y).
+    /// Get a pixel's grayscale value.
     #[inline]
     fn get_pixel(&self, x: u32, y: u32) -> u8 {
-        if x >= self.phys_width || y >= self.phys_height {
+        if x >= self.width || y >= self.height {
             return 255;
         }
-        let offset = (y * self.stride + x) as usize;
+        let offset = (y * self.stride() + x * self.bpp) as usize;
         let buf = self.buffer_ref();
         if offset < buf.len() {
-            buf[offset]
+            buf[offset] // Just read R channel
         } else {
             255
         }
     }
 
     pub fn clear(&mut self) {
+        let fill_len = self.width as usize * self.height as usize * self.bpp as usize;
         let buf = self.buffer_mut();
-        // Fill with white (0xFF)
-        buf.fill(0xFF);
+        buf[..fill_len].fill(0xFF);
     }
 
     pub fn fill_rect(&mut self, pos: Point2<i32>, size: cgmath::Vector2<u32>, c: color) {
         let x0 = pos.x.max(0) as u32;
         let y0 = pos.y.max(0) as u32;
-        let x1 = ((pos.x.max(0) as u32) + size.x).min(self.phys_width);
-        let y1 = ((pos.y.max(0) as u32) + size.y).min(self.phys_height);
+        let x1 = ((pos.x.max(0) as u32) + size.x).min(self.width);
+        let y1 = ((pos.y.max(0) as u32) + size.y).min(self.height);
         let gray = c.as_u8();
+        let bpp = self.bpp;
+        let stride = self.stride();
 
-        let stride = self.stride;
         let buf = self.buffer_mut();
         for y in y0..y1 {
-            let row_start = (y * stride + x0) as usize;
-            let row_end = (y * stride + x1) as usize;
+            let row_start = (y * stride + x0 * bpp) as usize;
+            let row_end = (y * stride + x1 * bpp) as usize;
             if row_end <= buf.len() {
-                buf[row_start..row_end].fill(gray);
+                // Fill RGB triples
+                for i in (row_start..row_end).step_by(3) {
+                    buf[i] = gray;
+                    buf[i + 1] = gray;
+                    buf[i + 2] = gray;
+                }
             }
         }
     }
@@ -266,7 +362,6 @@ impl DrmDisplay {
         let sx: i32 = if from.x < to.x { 1 } else { -1 };
         let sy: i32 = if from.y < to.y { 1 } else { -1 };
         let mut err = dx + dy;
-
         let mut x = from.x;
         let mut y = from.y;
         let half_w = width as i32 / 2;
@@ -277,7 +372,6 @@ impl DrmDisplay {
                     self.set_pixel((x + dx2) as u32, (y + dy2) as u32, c);
                 }
             }
-
             if x == to.x && y == to.y {
                 break;
             }
@@ -305,28 +399,42 @@ impl DrmDisplay {
         let w = size.x as i32;
         let h = size.y as i32;
 
-        // Top
         self.fill_rect(
             Point2 { x, y },
-            cgmath::Vector2 { x: size.x, y: border_px },
+            cgmath::Vector2 {
+                x: size.x,
+                y: border_px,
+            },
             c,
         );
-        // Bottom
         self.fill_rect(
-            Point2 { x, y: y + h - border_px as i32 },
-            cgmath::Vector2 { x: size.x, y: border_px },
+            Point2 {
+                x,
+                y: y + h - border_px as i32,
+            },
+            cgmath::Vector2 {
+                x: size.x,
+                y: border_px,
+            },
             c,
         );
-        // Left
         self.fill_rect(
             Point2 { x, y },
-            cgmath::Vector2 { x: border_px, y: size.y },
+            cgmath::Vector2 {
+                x: border_px,
+                y: size.y,
+            },
             c,
         );
-        // Right
         self.fill_rect(
-            Point2 { x: x + w - border_px as i32, y },
-            cgmath::Vector2 { x: border_px, y: size.y },
+            Point2 {
+                x: x + w - border_px as i32,
+                y,
+            },
+            cgmath::Vector2 {
+                x: border_px,
+                y: size.y,
+            },
             c,
         );
     }
@@ -337,12 +445,12 @@ impl DrmDisplay {
 
         for iy in 0..img_h {
             let dy = pos.y + iy as i32;
-            if dy < 0 || dy >= self.phys_height as i32 {
+            if dy < 0 || dy >= self.height as i32 {
                 continue;
             }
             for ix in 0..img_w {
                 let dx = pos.x + ix as i32;
-                if dx < 0 || dx >= self.phys_width as i32 {
+                if dx < 0 || dx >= self.width as i32 {
                     continue;
                 }
                 let pixel = img.get_pixel(ix, iy);
@@ -352,7 +460,6 @@ impl DrmDisplay {
         }
     }
 
-    /// Read back pixel data from a region (returns RGB888 bytes, 3 bytes per pixel).
     pub fn dump_region(&self, rect: mxcfb_rect) -> Option<Vec<u8>> {
         let mut data = Vec::with_capacity((rect.width * rect.height * 3) as usize);
         for y in rect.top..(rect.top + rect.height) {
@@ -366,7 +473,6 @@ impl DrmDisplay {
         Some(data)
     }
 
-    /// Render text. If `dryrun` is true, only measure and return bounding rect.
     pub fn draw_text(
         &mut self,
         pos: Point2<f32>,
@@ -377,8 +483,8 @@ impl DrmDisplay {
     ) -> mxcfb_rect {
         let mut x_offset = 0.0f32;
         let mut max_height = 0u32;
-
         let mut glyphs: Vec<(fontdue::Metrics, Vec<u8>, f32)> = Vec::new();
+
         for ch in text.chars() {
             let (metrics, bitmap) = self.font.rasterize(ch, size);
             let glyph_x = x_offset;
@@ -416,9 +522,10 @@ impl DrmDisplay {
                     }
                     let px = (gx + col as f32) as i32;
                     let py = (gy + row as f32) as i32;
-                    if px < 0 || py < 0
-                        || px >= self.phys_width as i32
-                        || py >= self.phys_height as i32
+                    if px < 0
+                        || py < 0
+                        || px >= self.width as i32
+                        || py >= self.height as i32
                     {
                         continue;
                     }
@@ -434,29 +541,90 @@ impl DrmDisplay {
         rect
     }
 
-    /// Convert physical pixel x coordinate to DRM ClipRect coordinate.
-    /// In packed format, 4 physical pixels = 1 DRM pixel.
-    #[inline]
-    fn phys_to_drm_x(&self, x: u32) -> u16 {
-        (x / 4).min(self.drm_width) as u16
+    /// Send a message to the QTFB server.
+    fn send_msg(&self, msg: &ClientMessage) {
+        let ret = unsafe {
+            libc::send(
+                self.fd,
+                msg as *const _ as *const libc::c_void,
+                std::mem::size_of::<ClientMessage>(),
+                0,
+            )
+        };
+        if ret < 0 {
+            log::warn!(
+                "QTFB send failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
     }
 
-    /// Trigger a full display refresh via DRM dirty FB ioctl.
+    /// Trigger a full display refresh.
     pub fn full_refresh(&self) -> u32 {
-        let clip = ClipRect::new(0, 0, self.drm_width as u16, self.drm_height as u16);
-        let _ = self.card.dirty_framebuffer(self.fb, &[clip]);
+        // Request full e-ink refresh (GC16 waveform)
+        let msg = ClientMessage {
+            msg_type: MESSAGE_REQUEST_FULL_REFRESH,
+            body: ClientMessageBody { refresh_mode: 0 },
+        };
+        self.send_msg(&msg);
+
+        // Also send a complete update
+        let update_msg = ClientMessage {
+            msg_type: MESSAGE_UPDATE,
+            body: ClientMessageBody {
+                update: UpdateContents {
+                    msg_type: UPDATE_ALL,
+                    x: 0,
+                    y: 0,
+                    w: 0,
+                    h: 0,
+                },
+            },
+        };
+        self.send_msg(&update_msg);
         0
     }
 
     /// Trigger a partial display refresh for a given region.
-    /// Region coordinates are in physical pixels; we convert to DRM pixel coords.
     pub fn partial_refresh(&self, region: &mxcfb_rect) -> u32 {
-        let x1 = self.phys_to_drm_x(region.left);
-        let y1 = region.top.min(self.drm_height) as u16;
-        let x2 = self.phys_to_drm_x(region.left + region.width);
-        let y2 = (region.top + region.height).min(self.drm_height) as u16;
-        let clip = ClipRect::new(x1, y1, x2, y2);
-        let _ = self.card.dirty_framebuffer(self.fb, &[clip]);
+        let msg = ClientMessage {
+            msg_type: MESSAGE_UPDATE,
+            body: ClientMessageBody {
+                update: UpdateContents {
+                    msg_type: UPDATE_PARTIAL,
+                    x: region.left as i32,
+                    y: region.top as i32,
+                    w: region.width as i32,
+                    h: region.height as i32,
+                },
+            },
+        };
+        self.send_msg(&msg);
         0
+    }
+
+    /// Set the waveform refresh mode.
+    pub fn set_refresh_mode(&self, fast: bool) {
+        let mode = if fast {
+            REFRESH_MODE_FAST
+        } else {
+            REFRESH_MODE_CONTENT
+        };
+        let msg = ClientMessage {
+            msg_type: MESSAGE_SET_REFRESH_MODE,
+            body: ClientMessageBody {
+                refresh_mode: mode,
+            },
+        };
+        self.send_msg(&msg);
+    }
+}
+
+impl Drop for QtfbDisplay {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.buffer as *mut libc::c_void, self.buffer_size);
+            libc::close(self.fd);
+        }
     }
 }

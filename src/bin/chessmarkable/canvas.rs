@@ -1,16 +1,22 @@
-use crate::rmpp_hal::display::DrmDisplay;
+use crate::rmpp_hal::display::QtfbDisplay;
 pub use crate::rmpp_hal::types::{color, mxcfb_rect, Point2, Vector2, vec2};
 pub use image;
+use std::os::unix::io::RawFd;
 
 pub struct Canvas {
-    display: DrmDisplay,
+    display: QtfbDisplay,
 }
 
 impl Canvas {
     pub fn new() -> Self {
         Canvas {
-            display: DrmDisplay::new(),
+            display: QtfbDisplay::new(),
         }
+    }
+
+    /// Return the QTFB socket fd for the input thread.
+    pub fn qtfb_fd(&self) -> RawFd {
+        self.display.socket_fd()
     }
 
     pub fn display_width(&self) -> u32 {
@@ -31,6 +37,12 @@ impl Canvas {
 
     pub fn update_partial(&mut self, region: &mxcfb_rect) -> u32 {
         self.display.partial_refresh(region)
+    }
+
+    pub fn wait_for_update(&mut self, _marker: u32) {
+        // E-ink refresh is handled by the cumulus FPGA asynchronously.
+        // Small delay to let the panel settle between updates.
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
     pub fn draw_multi_line_text(
