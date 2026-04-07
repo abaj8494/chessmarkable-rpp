@@ -222,29 +222,28 @@ impl Scene for MainMenuScene {
             50,
         ));
 
-        // Exit button at bottom with margin for bezel
-        let exit_y = crate::DISPLAY_HEIGHT as i32 - 200;
+        // Exit button in top-right corner
         if self.only_exit_to_xochitl {
             self.exit_xochitl_button_hitbox = Some(canvas.draw_button(
                 Point2 {
-                    x: None,
-                    y: Some(exit_y),
+                    x: Some(crate::DISPLAY_WIDTH as i32 - 450),
+                    y: Some(30),
                 },
                 "Exit to Xochitl",
-                125.0,
-                25,
-                50,
+                50.0,
+                15,
+                30,
             ));
         } else {
             self.exit_button_hitbox = Some(canvas.draw_button(
                 Point2 {
-                    x: None,
-                    y: Some(exit_y),
+                    x: Some(crate::DISPLAY_WIDTH as i32 - 200),
+                    y: Some(30),
                 },
                 "Exit",
-                125.0,
-                25,
-                50,
+                50.0,
+                15,
+                30,
             ));
         }
 
