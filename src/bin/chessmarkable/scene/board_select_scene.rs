@@ -83,10 +83,13 @@ impl Scene for BoardSelectScene {
         self.drawn = true;
 
         canvas.clear();
+
+        let sy = |y: i32| -> i32 { (y as f32 * crate::DISPLAY_HEIGHT as f32 / 1872.0) as i32 };
+
         canvas.draw_text(
             Point2 {
                 x: None,
-                y: Some(300),
+                y: Some(sy(300)),
             },
             "chessMarkable",
             150.0,
@@ -95,7 +98,7 @@ impl Scene for BoardSelectScene {
         canvas.draw_text(
             Point2 {
                 x: None,
-                y: Some(500),
+                y: Some(sy(500)),
             },
             "Continue on...",
             75.0,
@@ -104,7 +107,7 @@ impl Scene for BoardSelectScene {
         self.select_slot_1_button_hitbox = Some(canvas.draw_button(
             Point2 {
                 x: None,
-                y: Some(600),
+                y: Some(sy(600)),
             },
             "Slot 1",
             75.0,
@@ -116,7 +119,7 @@ impl Scene for BoardSelectScene {
             Point2 {
                 x: None,
                 y: Some(
-                    100 + self.select_slot_1_button_hitbox.unwrap().top as i32
+                    80 + self.select_slot_1_button_hitbox.unwrap().top as i32
                         + self.select_slot_1_button_hitbox.unwrap().height as i32,
                 ),
             },
@@ -130,7 +133,7 @@ impl Scene for BoardSelectScene {
             Point2 {
                 x: None,
                 y: Some(
-                    100 + self.select_slot_2_button_hitbox.unwrap().top as i32
+                    80 + self.select_slot_2_button_hitbox.unwrap().top as i32
                         + self.select_slot_2_button_hitbox.unwrap().height as i32,
                 ),
             },
@@ -140,19 +143,24 @@ impl Scene for BoardSelectScene {
             50,
         ));
 
+        // Position "Start over" section dynamically below the last continue slot
+        let start_over_y = self.select_slot_3_button_hitbox.unwrap().top as i32
+            + self.select_slot_3_button_hitbox.unwrap().height as i32
+            + 80;
         canvas.draw_text(
             Point2 {
                 x: None,
-                y: Some(1000),
+                y: Some(start_over_y),
             },
             "Start over on...",
             75.0,
         );
 
+        let reset_slot_1_y = start_over_y + 120;
         self.reset_slot_1_button_hitbox = Some(canvas.draw_button(
             Point2 {
                 x: None,
-                y: Some(1100),
+                y: Some(reset_slot_1_y),
             },
             "Slot 1",
             75.0,
@@ -164,7 +172,7 @@ impl Scene for BoardSelectScene {
             Point2 {
                 x: None,
                 y: Some(
-                    100 + self.reset_slot_1_button_hitbox.unwrap().top as i32
+                    80 + self.reset_slot_1_button_hitbox.unwrap().top as i32
                         + self.reset_slot_1_button_hitbox.unwrap().height as i32,
                 ),
             },
@@ -178,7 +186,7 @@ impl Scene for BoardSelectScene {
             Point2 {
                 x: None,
                 y: Some(
-                    100 + self.reset_slot_2_button_hitbox.unwrap().top as i32
+                    80 + self.reset_slot_2_button_hitbox.unwrap().top as i32
                         + self.reset_slot_2_button_hitbox.unwrap().height as i32,
                 ),
             },
@@ -191,7 +199,7 @@ impl Scene for BoardSelectScene {
         self.back_button_hitbox = Some(canvas.draw_button(
             Point2 {
                 x: None,
-                y: Some(1700),
+                y: Some(crate::DISPLAY_HEIGHT as i32 - 200),
             },
             "Back",
             125.0,

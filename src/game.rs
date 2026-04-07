@@ -211,7 +211,20 @@ impl ChessGame {
         Ok((Square::from(src_sq), destination))
     }
 
-    pub fn move_piece(&mut self, source: Square, destination: Square) -> Result<()> {
+    /// Check if a move from source to destination is a pawn promotion.
+    pub fn is_promotion_move(&self, source: Square, destination: Square) -> bool {
+        self.position.legal_moves().iter().any(|m| {
+            matches!(m, ShakmMove::Normal { from, to, promotion: Some(_), .. }
+                if *from == source.inner() && *to == destination.inner())
+        })
+    }
+
+    pub fn move_piece(
+        &mut self,
+        source: Square,
+        destination: Square,
+        promotion: Option<shakmaty::Role>,
+    ) -> Result<()> {
         ensure!(
             self.piece_on_square(self.turn(), source),
             "The playing player has no piece on the source square!"
@@ -226,17 +239,35 @@ impl ChessGame {
         let mut selected_move: Option<ShakmMove> = None;
 
         for legal_move in legal_moves.iter() {
-            let (src, dst) = match legal_move {
-                ShakmMove::Normal { from, to, .. } => (*from, *to),
-                ShakmMove::Castle { king, rook } => {
-                    // User clicks king square → rook square for castling
-                    (*king, *rook)
+            match legal_move {
+                ShakmMove::Normal {
+                    from,
+                    to,
+                    promotion: promo,
+                    ..
+                } => {
+                    if *from == source.inner() && *to == destination.inner() {
+                        if promo.is_some() {
+                            // Promotion move — only match if role matches
+                            if promotion == *promo {
+                                selected_move = Some(legal_move.clone());
+                            }
+                        } else {
+                            selected_move = Some(legal_move.clone());
+                        }
+                    }
                 }
-                ShakmMove::EnPassant { from, to } => (*from, *to),
+                ShakmMove::Castle { king, rook } => {
+                    if *king == source.inner() && *rook == destination.inner() {
+                        selected_move = Some(legal_move.clone());
+                    }
+                }
+                ShakmMove::EnPassant { from, to } => {
+                    if *from == source.inner() && *to == destination.inner() {
+                        selected_move = Some(legal_move.clone());
+                    }
+                }
                 ShakmMove::Put { .. } => continue,
-            };
-            if src == source.inner() && dst == destination.inner() {
-                selected_move = Some(legal_move.clone());
             }
         }
 

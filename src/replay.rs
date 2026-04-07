@@ -151,7 +151,7 @@ impl Replay {
     }
 
     pub fn player_move(&mut self, source: Square, destination: Square) -> ReplayResponse {
-        match self.active_game.move_piece(source, destination) {
+        match self.active_game.move_piece(source, destination, None) {
             Ok(_) => {
                 self.player_moves_played_offset += 1;
             }

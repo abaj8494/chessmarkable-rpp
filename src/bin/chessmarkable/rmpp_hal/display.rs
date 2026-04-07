@@ -294,35 +294,33 @@ impl QtfbDisplay {
         self.width * self.bpp
     }
 
-    /// Set a single pixel to the given grayscale color.
-    /// RGB888: write gray value to R, G, B channels.
+    /// Set a single pixel to the given RGB color.
     #[inline]
     fn set_pixel(&mut self, x: u32, y: u32, c: color) {
         if x >= self.width || y >= self.height {
             return;
         }
         let offset = (y * self.stride() + x * self.bpp) as usize;
-        let gray = c.as_u8();
         let buf = self.buffer_mut();
         if offset + 2 < buf.len() {
-            buf[offset] = gray;
-            buf[offset + 1] = gray;
-            buf[offset + 2] = gray;
+            buf[offset] = c.r;
+            buf[offset + 1] = c.g;
+            buf[offset + 2] = c.b;
         }
     }
 
-    /// Get a pixel's grayscale value.
+    /// Get a pixel's RGB color.
     #[inline]
-    fn get_pixel(&self, x: u32, y: u32) -> u8 {
+    fn get_pixel(&self, x: u32, y: u32) -> color {
         if x >= self.width || y >= self.height {
-            return 255;
+            return color::WHITE;
         }
         let offset = (y * self.stride() + x * self.bpp) as usize;
         let buf = self.buffer_ref();
-        if offset < buf.len() {
-            buf[offset] // Just read R channel
+        if offset + 2 < buf.len() {
+            color { r: buf[offset], g: buf[offset + 1], b: buf[offset + 2] }
         } else {
-            255
+            color::WHITE
         }
     }
 
@@ -337,7 +335,6 @@ impl QtfbDisplay {
         let y0 = pos.y.max(0) as u32;
         let x1 = ((pos.x.max(0) as u32) + size.x).min(self.width);
         let y1 = ((pos.y.max(0) as u32) + size.y).min(self.height);
-        let gray = c.as_u8();
         let bpp = self.bpp;
         let stride = self.stride();
 
@@ -346,11 +343,10 @@ impl QtfbDisplay {
             let row_start = (y * stride + x0 * bpp) as usize;
             let row_end = (y * stride + x1 * bpp) as usize;
             if row_end <= buf.len() {
-                // Fill RGB triples
                 for i in (row_start..row_end).step_by(3) {
-                    buf[i] = gray;
-                    buf[i + 1] = gray;
-                    buf[i + 2] = gray;
+                    buf[i] = c.r;
+                    buf[i + 1] = c.g;
+                    buf[i + 2] = c.b;
                 }
             }
         }
@@ -454,8 +450,7 @@ impl QtfbDisplay {
                     continue;
                 }
                 let pixel = img.get_pixel(ix, iy);
-                let gray = ((pixel[0] as u16 + pixel[1] as u16 + pixel[2] as u16) / 3) as u8;
-                self.set_pixel(dx as u32, dy as u32, color(gray));
+                self.set_pixel(dx as u32, dy as u32, color { r: pixel[0], g: pixel[1], b: pixel[2] });
             }
         }
     }
@@ -464,10 +459,10 @@ impl QtfbDisplay {
         let mut data = Vec::with_capacity((rect.width * rect.height * 3) as usize);
         for y in rect.top..(rect.top + rect.height) {
             for x in rect.left..(rect.left + rect.width) {
-                let gray = self.get_pixel(x, y);
-                data.push(gray);
-                data.push(gray);
-                data.push(gray);
+                let c = self.get_pixel(x, y);
+                data.push(c.r);
+                data.push(c.g);
+                data.push(c.b);
             }
         }
         Some(data)
@@ -508,7 +503,6 @@ impl QtfbDisplay {
         }
 
         let baseline_y = pos.y + size * 0.8;
-        let gray = c.as_u8();
 
         for (metrics, bitmap, glyph_x) in &glyphs {
             let gx = pos.x + glyph_x + metrics.xmin as f32;
@@ -532,8 +526,13 @@ impl QtfbDisplay {
 
                     let bg = self.get_pixel(px as u32, py as u32);
                     let a = alpha as f32 / 255.0;
-                    let blended = (gray as f32 * a + bg as f32 * (1.0 - a)) as u8;
-                    self.set_pixel(px as u32, py as u32, color(blended));
+                    let inv_a = 1.0 - a;
+                    let blended = color {
+                        r: (c.r as f32 * a + bg.r as f32 * inv_a) as u8,
+                        g: (c.g as f32 * a + bg.g as f32 * inv_a) as u8,
+                        b: (c.b as f32 * a + bg.b as f32 * inv_a) as u8,
+                    };
+                    self.set_pixel(px as u32, py as u32, blended);
                 }
             }
         }

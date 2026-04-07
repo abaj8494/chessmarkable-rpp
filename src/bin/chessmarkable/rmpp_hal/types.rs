@@ -26,22 +26,31 @@ impl mxcfb_rect {
     }
 }
 
-/// Grayscale color (0 = black, 255 = white).
+/// RGB color. The RPP Gallery 3 e-ink display supports color via QTFB RGB888.
 #[derive(Copy, Clone, Debug, PartialEq)]
-pub struct color(pub u8);
+pub struct color {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
 
 #[allow(non_upper_case_globals)]
 impl color {
-    pub const BLACK: color = color(0);
-    pub const WHITE: color = color(255);
+    pub const BLACK: color = color { r: 0, g: 0, b: 0 };
+    pub const WHITE: color = color { r: 255, g: 255, b: 255 };
 
     pub fn GRAY(v: u8) -> color {
-        color(v)
+        color { r: v, g: v, b: v }
     }
 
-    pub fn as_u8(self) -> u8 {
-        self.0
-    }
+    // Chess board colors (warm brown tones, lichess-inspired)
+    pub const LIGHT_SQUARE: color = color { r: 240, g: 217, b: 181 };
+    pub const DARK_SQUARE: color = color { r: 181, g: 136, b: 99 };
+    pub const SELECTED_SQ: color = color { r: 246, g: 246, b: 105 };
+    pub const LAST_MOVE_LIGHT: color = color { r: 205, g: 210, b: 106 };
+    pub const LAST_MOVE_DARK: color = color { r: 170, g: 162, b: 58 };
+    pub const MOVE_HINT_LIGHT: color = color { r: 170, g: 210, b: 130 };
+    pub const MOVE_HINT_DARK: color = color { r: 130, g: 170, b: 90 };
 }
 
 /// Input event from touch or buttons.

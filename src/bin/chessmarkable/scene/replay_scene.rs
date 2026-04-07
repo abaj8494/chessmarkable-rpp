@@ -173,9 +173,9 @@ impl ReplayScene {
                     },
                     self.piece_hitboxes[x][y].size().cast().unwrap(),
                     if is_bright_bg {
-                        color::GRAY(100)
+                        color::LIGHT_SQUARE
                     } else {
-                        color::GRAY(50)
+                        color::DARK_SQUARE
                     },
                 );
 

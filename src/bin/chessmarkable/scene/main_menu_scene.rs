@@ -68,10 +68,16 @@ impl MainMenuScene {
                 color::WHITE,
             );
         }
+        // Position rotate button dynamically below the Play! button
+        let rotate_y = if let Some(ref hitbox) = self.play_pvp_button_hitbox {
+            hitbox.top as i32 + hitbox.height as i32 + 15
+        } else {
+            780
+        };
         self.pvp_toggle_piece_rotation_hitbox = Some(canvas.draw_text(
             Point2 {
                 x: None,
-                y: Some(675),
+                y: Some(rotate_y),
             },
             "      Rotate board",
             50.0,
@@ -122,10 +128,14 @@ impl Scene for MainMenuScene {
         self.drawn = true;
 
         canvas.clear();
+
+        // Scale factor for RPP (2160) vs original rM2 (1872) layout
+        let sy = |y: i32| -> i32 { (y as f32 * crate::DISPLAY_HEIGHT as f32 / 1872.0) as i32 };
+
         canvas.draw_text(
             Point2 {
                 x: None,
-                y: Some(200),
+                y: Some(sy(200)),
             },
             "chessMarkable",
             150.0,
@@ -134,7 +144,7 @@ impl Scene for MainMenuScene {
         canvas.draw_text(
             Point2 {
                 x: None,
-                y: Some(400),
+                y: Some(sy(400)),
             },
             "Player vs Player",
             75.0,
@@ -143,7 +153,7 @@ impl Scene for MainMenuScene {
         self.play_pvp_button_hitbox = Some(canvas.draw_button(
             Point2 {
                 x: None,
-                y: Some(550),
+                y: Some(sy(530)),
             },
             "Play!",
             125.0,
@@ -156,7 +166,7 @@ impl Scene for MainMenuScene {
         canvas.draw_text(
             Point2 {
                 x: None,
-                y: Some(800),
+                y: Some(sy(800)),
             },
             "Player vs Bot",
             75.0,
@@ -165,7 +175,7 @@ impl Scene for MainMenuScene {
         self.play_easy_button_hitbox = Some(canvas.draw_button(
             Point2 {
                 x: None,
-                y: Some(950),
+                y: Some(sy(920)),
             },
             "Easy",
             125.0,
@@ -176,7 +186,7 @@ impl Scene for MainMenuScene {
             Point2 {
                 x: None,
                 y: Some(
-                    150 + self.play_easy_button_hitbox.unwrap().top as i32
+                    100 + self.play_easy_button_hitbox.unwrap().top as i32
                         + self.play_easy_button_hitbox.unwrap().height as i32,
                 ),
             },
@@ -189,7 +199,7 @@ impl Scene for MainMenuScene {
             Point2 {
                 x: None,
                 y: Some(
-                    150 + self.play_normal_button_hitbox.unwrap().top as i32
+                    100 + self.play_normal_button_hitbox.unwrap().top as i32
                         + self.play_normal_button_hitbox.unwrap().height as i32,
                 ),
             },
@@ -202,7 +212,7 @@ impl Scene for MainMenuScene {
             Point2 {
                 x: None,
                 y: Some(
-                    175 + self.play_hard_button_hitbox.unwrap().top as i32
+                    120 + self.play_hard_button_hitbox.unwrap().top as i32
                         + self.play_hard_button_hitbox.unwrap().height as i32,
                 ),
             },
@@ -212,11 +222,13 @@ impl Scene for MainMenuScene {
             50,
         ));
 
+        // Exit button at bottom with margin for bezel
+        let exit_y = crate::DISPLAY_HEIGHT as i32 - 200;
         if self.only_exit_to_xochitl {
             self.exit_xochitl_button_hitbox = Some(canvas.draw_button(
                 Point2 {
                     x: None,
-                    y: Some(1750),
+                    y: Some(exit_y),
                 },
                 "Exit to Xochitl",
                 125.0,
@@ -227,7 +239,7 @@ impl Scene for MainMenuScene {
             self.exit_button_hitbox = Some(canvas.draw_button(
                 Point2 {
                     x: None,
-                    y: Some(1750),
+                    y: Some(exit_y),
                 },
                 "Exit",
                 125.0,

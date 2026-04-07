@@ -117,6 +117,10 @@ pub struct GameScene {
     black_update_receiver: Option<Receiver<ChessUpdate>>,
     possible_moves: Vec<(Square, Square)>,
     runtime: runtime::Runtime,
+    // Promotion UI state
+    promotion_pending: Option<(Square, Square)>,
+    promotion_hitboxes: [Option<mxcfb_rect>; 4], // Queen, Rook, Bishop, Knight
+    promotion_drawn: bool,
 }
 
 impl GameScene {
@@ -289,6 +293,9 @@ impl GameScene {
             white_request_sender,
             white_update_receiver,
             possible_moves: vec![],
+            promotion_pending: None,
+            promotion_hitboxes: [None; 4],
+            promotion_drawn: false,
         }
     }
 
@@ -370,9 +377,9 @@ impl GameScene {
                     },
                     self.piece_hitboxes[x][y].size().cast().unwrap(),
                     if is_bright_bg {
-                        color::GRAY(100)
+                        color::LIGHT_SQUARE
                     } else {
-                        color::GRAY(50)
+                        color::DARK_SQUARE
                     },
                 );
 
@@ -512,12 +519,7 @@ impl GameScene {
         }
     }
 
-    fn on_user_move(&mut self, src: Square, dest: Square) {
-        self.selected_square = None;
-        self.finger_down_square = None;
-        self.clear_move_hints();
-        self.clear_last_moved_hints();
-
+    fn send_move(&mut self, src: Square, dest: Square, promotion: Option<Role>) {
         let current_turn: Player = { let t: Player = self.board.turn().into(); t };
         let sender = match current_turn {
             Player::Black => self.black_request_sender.clone(),
@@ -539,6 +541,7 @@ impl GameScene {
                 .send(ChessRequest::MovePiece {
                     source: src,
                     destination: dest,
+                    promotion,
                 })
                 .await
                 .ok();
@@ -553,6 +556,27 @@ impl GameScene {
                 Some(Duration::from_millis(100)),
             );
         }
+    }
+
+    fn on_user_move(&mut self, src: Square, dest: Square) {
+        self.selected_square = None;
+        self.finger_down_square = None;
+        self.clear_move_hints();
+        self.clear_last_moved_hints();
+
+        // Check if this is a promotion move
+        let is_promo = self.board.legal_moves().iter().any(|m| {
+            matches!(m, shakmaty::Move::Normal { from, to, promotion: Some(_), .. }
+                if *from == src.inner() && *to == dest.inner())
+        });
+        if is_promo {
+            self.promotion_pending = Some((src, dest));
+            self.promotion_drawn = false;
+            self.redraw_all_squares = true;
+            return;
+        }
+
+        self.send_move(src, dest, None);
     }
 
     fn clear_last_moved_hints(&mut self) {
@@ -730,6 +754,27 @@ impl Scene for GameScene {
                         }
                     }
                     MultitouchEvent::Release { finger } => {
+                        // Handle promotion piece selection
+                        if let Some((src, dest)) = self.promotion_pending {
+                            let roles = [Role::Queen, Role::Rook, Role::Bishop, Role::Knight];
+                            for (i, role) in roles.iter().enumerate() {
+                                if let Some(hitbox) = self.promotion_hitboxes[i] {
+                                    if Canvas::is_hitting(finger.pos, hitbox) {
+                                        self.promotion_pending = None;
+                                        self.promotion_hitboxes = [None; 4];
+                                        self.redraw_all_squares = true;
+                                        self.send_move(src, dest, Some(*role));
+                                        return;
+                                    }
+                                }
+                            }
+                            // Tap outside modal cancels promotion
+                            self.promotion_pending = None;
+                            self.promotion_hitboxes = [None; 4];
+                            self.redraw_all_squares = true;
+                            return;
+                        }
+
                         if self.back_button_hitbox.is_some()
                             && Canvas::is_hitting(finger.pos, self.back_button_hitbox.unwrap())
                         {
@@ -1038,7 +1083,7 @@ impl Scene for GameScene {
                     GameBottomInfo::GameEnded(ref short_message) => canvas.draw_text(
                         Point2 {
                             x: None,
-                            y: Some(crate::DISPLAY_HEIGHT as i32 - 100),
+                            y: Some(crate::DISPLAY_HEIGHT as i32 - 250),
                         },
                         short_message,
                         100.0,
@@ -1046,7 +1091,7 @@ impl Scene for GameScene {
                     GameBottomInfo::Info(ref message) => canvas.draw_text(
                         Point2 {
                             x: None,
-                            y: Some(crate::DISPLAY_HEIGHT as i32 - 20),
+                            y: Some(crate::DISPLAY_HEIGHT as i32 - 150),
                         },
                         message,
                         50.0,
@@ -1054,7 +1099,7 @@ impl Scene for GameScene {
                     GameBottomInfo::Error(ref message) => canvas.draw_text(
                         Point2 {
                             x: Some(5),
-                            y: Some(crate::DISPLAY_HEIGHT as i32 - 10),
+                            y: Some(crate::DISPLAY_HEIGHT as i32 - 100),
                         },
                         message,
                         35.0,
@@ -1069,6 +1114,74 @@ impl Scene for GameScene {
                     self.draw_game_bottom_info_clear_at = None;
                 }
             }
+        }
+
+        // Draw promotion selection modal
+        if self.promotion_pending.is_some() && !self.promotion_drawn {
+            self.promotion_drawn = true;
+            let square_size = crate::DISPLAY_WIDTH.min(crate::DISPLAY_HEIGHT) / 8;
+
+            // Determine piece color based on current turn
+            let piece_color = self.board.turn();
+            let roles = [Role::Queen, Role::Rook, Role::Bishop, Role::Knight];
+
+            // Modal: 4 squares wide, centered on screen
+            let modal_w = square_size * 4 + 40; // 4 pieces + padding
+            let modal_h = square_size + 80; // 1 piece + text + padding
+            let modal_x = (crate::DISPLAY_WIDTH - modal_w) / 2;
+            let modal_y = (crate::DISPLAY_HEIGHT - modal_h) / 2;
+
+            // Draw modal background
+            canvas.fill_rect(
+                Point2 { x: Some(modal_x as i32 - 5), y: Some(modal_y as i32 - 5) },
+                Vector2 { x: modal_w + 10, y: modal_h + 10 },
+                color::BLACK,
+            );
+            canvas.fill_rect(
+                Point2 { x: Some(modal_x as i32), y: Some(modal_y as i32) },
+                Vector2 { x: modal_w, y: modal_h },
+                color::WHITE,
+            );
+
+            // Draw "Promote to:" text
+            canvas.draw_text(
+                Point2 { x: None, y: Some(modal_y as i32 + 10) },
+                "Promote to:",
+                40.0,
+            );
+
+            // Draw 4 piece options
+            let piece_size = square_size - 20;
+            let start_x = modal_x + 20;
+            let piece_y = modal_y + 60;
+            for (i, role) in roles.iter().enumerate() {
+                let piece = ShakmPiece { color: piece_color, role: *role };
+                let piece_img = get_orig_piece_img(&piece).resize(
+                    piece_size, piece_size, FilterType::Lanczos3,
+                );
+
+                let px = start_x + i as u32 * square_size;
+                canvas.draw_image(
+                    Point2 { x: px as i32, y: piece_y as i32 },
+                    &piece_img,
+                    false,
+                );
+
+                self.promotion_hitboxes[i] = Some(mxcfb_rect {
+                    left: px,
+                    top: piece_y,
+                    width: piece_size,
+                    height: piece_size,
+                });
+            }
+
+            let modal_rect = mxcfb_rect {
+                left: modal_x - 5,
+                top: modal_y - 5,
+                width: modal_w + 10,
+                height: modal_h + 10,
+            };
+            canvas.update_partial(&modal_rect);
         }
     }
 }

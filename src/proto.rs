@@ -23,7 +23,12 @@ pub enum ChessRequest {
     CurrentBoard,
     CurrentTotalMoves,
     CurrentOutcome,
-    MovePiece { source: Square, destination: Square },
+    MovePiece {
+        source: Square,
+        destination: Square,
+        #[serde(skip)]
+        promotion: Option<shakmaty::Role>,
+    },
     Abort { message: String },
     UndoMoves { moves: u16 },
 }
@@ -253,9 +258,10 @@ pub async fn create_game(
             ChessRequest::MovePiece {
                 source,
                 destination,
+                promotion,
             } => {
                 let prev_outcome = game.outcome();
-                match game.move_piece(source, destination) {
+                match game.move_piece(source, destination, promotion) {
                     Ok(_) => {
                         send_to_everyone!(ChessUpdate::PlayerMovedAPiece {
                             player: sender,
@@ -576,10 +582,15 @@ pub async fn create_bot(
                         if let Some(m) = bot_move {
                             let src = move_src(&m).unwrap();
                             let dst = move_dst(&m);
+                            let promotion = match &m {
+                                shakmaty::Move::Normal { promotion, .. } => *promotion,
+                                _ => None,
+                            };
                             request_tx
                                 .send(ChessRequest::MovePiece {
                                     source: Square::from(src),
                                     destination: Square::from(dst),
+                                    promotion,
                                 })
                                 .await
                                 .expect("Bot failed to send move");
