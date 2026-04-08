@@ -80,16 +80,16 @@ impl Replay {
                 ),
                 Move::CastleKingside => {
                     if self.is_white_turn {
-                        ShakmSquare::from_coords(ShakmFile::H, ShakmRank::First)
+                        ShakmSquare::from_coords(ShakmFile::G, ShakmRank::First)
                     } else {
-                        ShakmSquare::from_coords(ShakmFile::H, ShakmRank::Eighth)
+                        ShakmSquare::from_coords(ShakmFile::G, ShakmRank::Eighth)
                     }
                 }
                 Move::CastleQueenside => {
                     if self.is_white_turn {
-                        ShakmSquare::from_coords(ShakmFile::A, ShakmRank::First)
+                        ShakmSquare::from_coords(ShakmFile::C, ShakmRank::First)
                     } else {
-                        ShakmSquare::from_coords(ShakmFile::A, ShakmRank::Eighth)
+                        ShakmSquare::from_coords(ShakmFile::C, ShakmRank::Eighth)
                     }
                 }
             };
