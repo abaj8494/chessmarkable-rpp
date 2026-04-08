@@ -13,6 +13,7 @@ use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 #[derive(Clone, Debug)]
 pub struct ChessConfig {
     pub starting_fen: Option<String>,
+    pub starting_pgn: Option<String>,
     pub can_black_undo: bool,
     pub can_white_undo: bool,
     pub allow_undo_after_loose: bool,
@@ -55,6 +56,7 @@ pub enum ChessUpdate {
     PlayerSwitch {
         player: Player,
         fen: String,
+        pgn: String,
     },
     MovePieceFailedResponse {
         message: String,
@@ -98,7 +100,9 @@ pub async fn create_game(
     spectators: (Sender<ChessUpdate>, Receiver<ChessRequest>),
     config: ChessConfig,
 ) -> Result<()> {
-    let mut game = if let Some(ref fen) = config.starting_fen {
+    let mut game = if let Some(ref pgn) = config.starting_pgn {
+        ChessGame::from_pgn(pgn)?
+    } else if let Some(ref fen) = config.starting_fen {
         ChessGame::from_fen(fen)?
     } else {
         ChessGame::default()
@@ -183,7 +187,8 @@ pub async fn create_game(
     // Start
     send_to_everyone!(ChessUpdate::PlayerSwitch {
         player: game.turn(),
-        fen: game.fen()
+        fen: game.fen(),
+        pgn: game.to_pgn(),
     });
     let possible_moves = moves_to_square_pairs(&game);
     match game.turn() {
@@ -278,6 +283,7 @@ pub async fn create_game(
                         send_to_everyone!(ChessUpdate::PlayerSwitch {
                             player: game.turn(),
                             fen: game.fen(),
+                            pgn: game.to_pgn(),
                         });
 
                         if new_outcome.is_none() {
@@ -335,7 +341,8 @@ pub async fn create_game(
                         }
                         send_to_everyone!(ChessUpdate::PlayerSwitch {
                             player: game.turn(),
-                            fen: game.fen()
+                            fen: game.fen(),
+                            pgn: game.to_pgn(),
                         });
                         let possible_moves = moves_to_square_pairs(&game);
                         match game.turn() {
@@ -551,7 +558,7 @@ pub async fn create_bot(
         let mut current_outcome: Option<ChessOutcome> = None;
         while let Some(update) = update_rx.recv().await {
             match update {
-                ChessUpdate::PlayerSwitch { player, ref fen } => {
+                ChessUpdate::PlayerSwitch { player, ref fen, .. } => {
                     if player == me && current_outcome.is_none() {
                         let fen_str = fen.clone();
                         let search_depth = depth;

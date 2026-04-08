@@ -60,7 +60,7 @@ impl BoardSelectScene {
         let rect = canvas.draw_text(
             Point2 {
                 x: None,
-                y: Some(350),
+                y: Some(280),
             },
             "Loading game... (preparing assets)",
             50.0,

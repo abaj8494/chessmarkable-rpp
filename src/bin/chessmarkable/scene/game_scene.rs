@@ -72,6 +72,15 @@ pub enum SavestateSlot {
     Third,
 }
 
+#[derive(Clone)]
+enum KeyAction {
+    Char(char),
+    Backspace,
+    Space,
+    Save,
+    Cancel,
+}
+
 pub struct GameScene {
     board: Chess,
     /// May be above zero when a fen was imported. Used to prevent panic on undo.
@@ -121,6 +130,13 @@ pub struct GameScene {
     promotion_pending: Option<(Square, Square)>,
     promotion_hitboxes: [Option<mxcfb_rect>; 4], // Queen, Rook, Bishop, Knight
     promotion_drawn: bool,
+    current_pgn: String,
+    // Save As UI state
+    save_as_button_hitbox: Option<mxcfb_rect>,
+    show_keyboard: bool,
+    keyboard_input: String,
+    keyboard_key_hitboxes: Vec<(mxcfb_rect, KeyAction)>,
+    keyboard_drawn: bool,
 }
 
 impl GameScene {
@@ -188,10 +204,18 @@ impl GameScene {
             .build()
             .expect("Failed to create tokio runtime");
 
-        let starting_fen = match savestate_slot {
+        let saved_data = match savestate_slot {
             SavestateSlot::First => crate::SAVESTATES.lock().unwrap().slot_1.clone(),
             SavestateSlot::Second => crate::SAVESTATES.lock().unwrap().slot_2.clone(),
             SavestateSlot::Third => crate::SAVESTATES.lock().unwrap().slot_3.clone(),
+        };
+
+        // Detect PGN vs FEN: PGN starts with '[' (tags) or contains move numbers
+        let (starting_fen, starting_pgn) = match &saved_data {
+            Some(data) if data.trim_start().starts_with('[') || data.contains("1.") => {
+                (None, Some(data.clone()))
+            }
+            other => (other.clone(), None),
         };
 
         let white_request_sender: Option<Sender<ChessRequest>>;
@@ -211,7 +235,8 @@ impl GameScene {
                 (black_update_tx, black_request_rx),
                 stubbed_spectator(),
                 ChessConfig {
-                    starting_fen,
+                    starting_fen: starting_fen.clone(),
+                    starting_pgn: starting_pgn.clone(),
                     can_black_undo: true,
                     can_white_undo: true,
                     allow_undo_after_loose: true,
@@ -242,6 +267,7 @@ impl GameScene {
                 stubbed_spectator(),
                 ChessConfig {
                     starting_fen,
+                    starting_pgn,
                     can_black_undo: false,
                     can_white_undo: true,
                     allow_undo_after_loose: true,
@@ -296,6 +322,12 @@ impl GameScene {
             promotion_pending: None,
             promotion_hitboxes: [None; 4],
             promotion_drawn: false,
+            current_pgn: String::new(),
+            save_as_button_hitbox: None,
+            show_keyboard: false,
+            keyboard_input: String::new(),
+            keyboard_key_hitboxes: Vec::new(),
+            keyboard_drawn: false,
         }
     }
 
@@ -685,17 +717,27 @@ impl GameScene {
                     }
                     info!("{} (is_local_user: {}) made a move", player, is_local_user);
                 }
-                ChessUpdate::PlayerSwitch { player, ref fen } => {
+                ChessUpdate::PlayerSwitch { player, ref fen, ref pgn } => {
                     self.update_board(fen);
-                    // TODO: Better message depending on game mode
+                    self.current_pgn = pgn.clone();
                     if !self.is_game_over {
+                        let in_check = self.board.is_check();
                         let message = if !self.is_local_user(player) {
-                            None
-                        } else {
-                            if !self.is_local_user(player.other_player()) {
-                                Some("It's your turn.".to_owned())
+                            if in_check {
+                                Some("Check!".to_owned())
                             } else {
-                                Some(format!("It's {}'s turn.", player))
+                                None
+                            }
+                        } else {
+                            let turn_msg = if !self.is_local_user(player.other_player()) {
+                                "It's your turn.".to_owned()
+                            } else {
+                                format!("It's {}'s turn.", player)
+                            };
+                            if in_check {
+                                Some(format!("Check! {}", turn_msg))
+                            } else {
+                                Some(turn_msg)
                             }
                         };
 
@@ -738,10 +780,259 @@ impl GameScene {
     }
 }
 
+impl GameScene {
+    fn draw_keyboard(&mut self, canvas: &mut Canvas) {
+        self.keyboard_key_hitboxes.clear();
+
+        let dw = crate::DISPLAY_WIDTH;
+        let dh = crate::DISPLAY_HEIGHT;
+
+        // Keyboard modal background
+        let modal_w = 1400u32;
+        let modal_h = 1100u32;
+        let modal_x = (dw - modal_w) / 2;
+        let modal_y = (dh - modal_h) / 2;
+
+        canvas.fill_rect(
+            Point2 { x: Some(modal_x as i32), y: Some(modal_y as i32) },
+            Vector2 { x: modal_w, y: modal_h },
+            color::WHITE,
+        );
+        canvas.draw_rect(
+            Point2 { x: Some(modal_x as i32), y: Some(modal_y as i32) },
+            Vector2 { x: modal_w, y: modal_h },
+            4,
+        );
+
+        // Title
+        canvas.draw_text(
+            Point2 { x: None, y: Some(modal_y as i32 + 40) },
+            "Save PGN As:",
+            65.0,
+        );
+
+        // Text input display
+        let input_y = modal_y as i32 + 130;
+        let input_display = if self.keyboard_input.is_empty() {
+            "_ ".to_string()
+        } else {
+            format!("{}_", self.keyboard_input)
+        };
+        canvas.fill_rect(
+            Point2 { x: Some(modal_x as i32 + 40), y: Some(input_y) },
+            Vector2 { x: modal_w - 80, y: 80 },
+            color::WHITE,
+        );
+        canvas.draw_rect(
+            Point2 { x: Some(modal_x as i32 + 40), y: Some(input_y) },
+            Vector2 { x: modal_w - 80, y: 80 },
+            3,
+        );
+        canvas.draw_text(
+            Point2 { x: Some(modal_x as i32 + 60), y: Some(input_y + 12) },
+            &input_display,
+            55.0,
+        );
+
+        // Keyboard layout
+        let rows: &[&[char]] = &[
+            &['Q','W','E','R','T','Y','U','I','O','P'],
+            &['A','S','D','F','G','H','J','K','L'],
+            &['Z','X','C','V','B','N','M'],
+            &['0','1','2','3','4','5','6','7','8','9'],
+        ];
+
+        let key_w = 110u32;
+        let key_h = 90u32;
+        let key_gap = 10u32;
+        let start_y = modal_y as i32 + 240;
+
+        for (row_idx, row) in rows.iter().enumerate() {
+            let row_w = row.len() as u32 * key_w + (row.len() as u32 - 1) * key_gap;
+            let row_x = (dw - row_w) / 2;
+            let row_y = start_y + row_idx as i32 * (key_h as i32 + key_gap as i32);
+
+            for (col_idx, &ch) in row.iter().enumerate() {
+                let kx = row_x as i32 + col_idx as i32 * (key_w as i32 + key_gap as i32);
+                let hitbox = canvas.draw_button(
+                    Point2 { x: Some(kx + key_w as i32 / 2 - 15), y: Some(row_y + 10) },
+                    &ch.to_string(),
+                    55.0,
+                    10,
+                    (key_w / 2 - 15) as u32,
+                );
+                self.keyboard_key_hitboxes.push((
+                    mxcfb_rect { left: kx as u32, top: row_y as u32, width: key_w, height: key_h },
+                    KeyAction::Char(ch),
+                ));
+            }
+
+            // Backspace on row 3 (Z row)
+            if row_idx == 2 {
+                let bksp_x = row_x as i32 + row.len() as i32 * (key_w as i32 + key_gap as i32);
+                let bksp_w = key_w * 2;
+                canvas.draw_button(
+                    Point2 { x: Some(bksp_x + 20), y: Some(row_y + 10) },
+                    "Del",
+                    55.0,
+                    10,
+                    50,
+                );
+                self.keyboard_key_hitboxes.push((
+                    mxcfb_rect { left: bksp_x as u32, top: row_y as u32, width: bksp_w, height: key_h },
+                    KeyAction::Backspace,
+                ));
+            }
+        }
+
+        // Bottom row: Space, Save, Cancel
+        let bottom_y = start_y + 4 * (key_h as i32 + key_gap as i32) + 20;
+        let btn_h = 90u32;
+
+        // Space
+        let space_w = 400u32;
+        let space_x = (dw / 2 - space_w / 2 - 350) as i32;
+        canvas.draw_button(
+            Point2 { x: Some(space_x + 100), y: Some(bottom_y + 10) },
+            "Space",
+            55.0,
+            10,
+            100,
+        );
+        self.keyboard_key_hitboxes.push((
+            mxcfb_rect { left: space_x as u32, top: bottom_y as u32, width: space_w, height: btn_h },
+            KeyAction::Space,
+        ));
+
+        // Save
+        let save_w = 300u32;
+        let save_x = (dw / 2 - save_w / 2) as i32;
+        canvas.draw_button(
+            Point2 { x: Some(save_x + 70), y: Some(bottom_y + 10) },
+            "Save",
+            55.0,
+            10,
+            80,
+        );
+        self.keyboard_key_hitboxes.push((
+            mxcfb_rect { left: save_x as u32, top: bottom_y as u32, width: save_w, height: btn_h },
+            KeyAction::Save,
+        ));
+
+        // Cancel
+        let cancel_w = 350u32;
+        let cancel_x = (dw / 2 + save_w / 2 + 50) as i32;
+        canvas.draw_button(
+            Point2 { x: Some(cancel_x + 50), y: Some(bottom_y + 10) },
+            "Cancel",
+            55.0,
+            10,
+            80,
+        );
+        self.keyboard_key_hitboxes.push((
+            mxcfb_rect { left: cancel_x as u32, top: bottom_y as u32, width: cancel_w, height: btn_h },
+            KeyAction::Cancel,
+        ));
+
+        canvas.update_full();
+        self.keyboard_drawn = true;
+    }
+
+    fn save_pgn_to_file(&self, filename: &str) -> Result<(), String> {
+        let pgn_dir = &crate::CLI_OPTS.pgn_location;
+        if !pgn_dir.exists() {
+            std::fs::create_dir_all(pgn_dir)
+                .map_err(|e| format!("Failed to create PGN directory: {}", e))?;
+        }
+
+        // Sanitize filename
+        let safe_name: String = filename.chars()
+            .filter(|c| c.is_alphanumeric() || *c == ' ' || *c == '-' || *c == '_')
+            .collect();
+        let safe_name = safe_name.trim();
+        if safe_name.is_empty() {
+            return Err("Filename cannot be empty".to_string());
+        }
+
+        let file_path = pgn_dir.join(format!("{}.pgn", safe_name));
+        std::fs::write(&file_path, &self.current_pgn)
+            .map_err(|e| format!("Failed to write PGN: {}", e))?;
+
+        info!("Saved PGN to {:?}", file_path);
+        Ok(())
+    }
+}
+
 impl Scene for GameScene {
     fn on_input(&mut self, event: InputEvent) {
         match event {
             InputEvent::MultitouchEvent { event } => {
+                // Handle keyboard input when visible
+                if self.show_keyboard {
+                    if let MultitouchEvent::Release { finger } = event {
+                        let mut action: Option<KeyAction> = None;
+                        for (hitbox, key_action) in &self.keyboard_key_hitboxes {
+                            if Canvas::is_hitting(finger.pos, *hitbox) {
+                                action = Some(key_action.clone());
+                                break;
+                            }
+                        }
+                        if let Some(action) = action {
+                            match action {
+                                KeyAction::Char(c) => {
+                                    if self.keyboard_input.len() < 40 {
+                                        self.keyboard_input.push(c);
+                                        self.keyboard_drawn = false;
+                                    }
+                                }
+                                KeyAction::Space => {
+                                    if self.keyboard_input.len() < 40 {
+                                        self.keyboard_input.push(' ');
+                                        self.keyboard_drawn = false;
+                                    }
+                                }
+                                KeyAction::Backspace => {
+                                    self.keyboard_input.pop();
+                                    self.keyboard_drawn = false;
+                                }
+                                KeyAction::Save => {
+                                    let name = self.keyboard_input.clone();
+                                    match self.save_pgn_to_file(&name) {
+                                        Ok(_) => {
+                                            self.show_keyboard = false;
+                                            self.keyboard_drawn = false;
+                                            self.keyboard_input.clear();
+                                            self.redraw_all_squares = true;
+                                            self.first_draw = true;
+                                            self.show_bottom_game_info(
+                                                GameBottomInfo::Info(format!("Saved as {}.pgn", name.trim())),
+                                                None,
+                                                Some(Duration::from_secs(5)),
+                                            );
+                                        }
+                                        Err(e) => {
+                                            self.show_bottom_game_info(
+                                                GameBottomInfo::Error(e),
+                                                None,
+                                                Some(Duration::from_secs(5)),
+                                            );
+                                            self.keyboard_drawn = false;
+                                        }
+                                    }
+                                }
+                                KeyAction::Cancel => {
+                                    self.show_keyboard = false;
+                                    self.keyboard_drawn = false;
+                                    self.keyboard_input.clear();
+                                    self.redraw_all_squares = true;
+                                    self.first_draw = true;
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+
                 // Taps and buttons
                 match event {
                     MultitouchEvent::Press { finger } => {
@@ -778,13 +1069,13 @@ impl Scene for GameScene {
                         if self.back_button_hitbox.is_some()
                             && Canvas::is_hitting(finger.pos, self.back_button_hitbox.unwrap())
                         {
-                            // Save game
-                            let fen = shakmaty::fen::Fen::from_position(&self.board, shakmaty::EnPassantMode::Legal).to_string();
+                            // Save game as PGN
+                            let pgn = self.current_pgn.clone();
                             let mut savesstates = crate::SAVESTATES.lock().unwrap();
                             match self.savestate_slot {
-                                SavestateSlot::First => savesstates.slot_1 = Some(fen),
-                                SavestateSlot::Second => savesstates.slot_2 = Some(fen),
-                                SavestateSlot::Third => savesstates.slot_3 = Some(fen),
+                                SavestateSlot::First => savesstates.slot_1 = Some(pgn),
+                                SavestateSlot::Second => savesstates.slot_2 = Some(pgn),
+                                SavestateSlot::Third => savesstates.slot_3 = Some(pgn),
                             }
                             if let Err(err) = crate::savestates::write(&savesstates) {
                                 error!("Failed to write savestates file!");
@@ -852,6 +1143,15 @@ impl Scene for GameScene {
                             )
                         {
                             self.force_full_refresh = Some(SystemTime::now());
+                        } else if self.save_as_button_hitbox.is_some()
+                            && Canvas::is_hitting(
+                                finger.pos,
+                                self.save_as_button_hitbox.unwrap(),
+                            )
+                        {
+                            self.show_keyboard = true;
+                            self.keyboard_drawn = false;
+                            self.keyboard_input.clear();
                         } else if !self.is_game_over {
                             for x in 0..8 {
                                 for y in 0..8 {
@@ -938,43 +1238,62 @@ impl Scene for GameScene {
             // First frame
             canvas.clear();
 
+            let btn_font = 50.0;
+            let btn_vgap = 8;
+            let btn_hgap = 15;
+            let btn_spacing = 20;
+
             self.back_button_hitbox = Some(canvas.draw_button(
                 Point2 {
-                    x: Some(50),
+                    x: Some(30),
                     y: Some(90),
                 },
                 "Save & Quit",
-                75.0,
-                10,
-                20,
+                btn_font,
+                btn_vgap,
+                btn_hgap,
             ));
             self.undo_button_hitbox = Some(canvas.draw_button(
                 Point2 {
                     x: Some(
                         self.back_button_hitbox.unwrap().left as i32
                             + self.back_button_hitbox.unwrap().width as i32
-                            + 50,
+                            + btn_spacing,
                     ),
                     y: Some(90),
                 },
                 "Undo",
-                75.0,
-                10,
-                20,
+                btn_font,
+                btn_vgap,
+                btn_hgap,
             ));
             self.full_refresh_button_hitbox = Some(canvas.draw_button(
                 Point2 {
                     x: Some(
                         self.undo_button_hitbox.unwrap().left as i32
                             + self.undo_button_hitbox.unwrap().width as i32
-                            + 50,
+                            + btn_spacing,
                     ),
                     y: Some(90),
                 },
-                "Refresh Screen",
-                75.0,
-                10,
-                20,
+                "Refresh",
+                btn_font,
+                btn_vgap,
+                btn_hgap,
+            ));
+            self.save_as_button_hitbox = Some(canvas.draw_button(
+                Point2 {
+                    x: Some(
+                        self.full_refresh_button_hitbox.unwrap().left as i32
+                            + self.full_refresh_button_hitbox.unwrap().width as i32
+                            + btn_spacing,
+                    ),
+                    y: Some(90),
+                },
+                "Save As",
+                btn_font,
+                btn_vgap,
+                btn_hgap,
             ));
             self.redraw_all_squares = true;
             self.draw_board(canvas);
@@ -1182,6 +1501,11 @@ impl Scene for GameScene {
                 height: modal_h + 10,
             };
             canvas.update_partial(&modal_rect);
+        }
+
+        // Draw keyboard overlay for Save As
+        if self.show_keyboard && !self.keyboard_drawn {
+            self.draw_keyboard(canvas);
         }
     }
 }

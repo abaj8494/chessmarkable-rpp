@@ -2,7 +2,7 @@ pub use crate::{Player, Square};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use shakmaty::{
-    fen::Fen, CastlingMode, Chess, Color as ShakmColor, File as ShakmFile,
+    fen::Fen, san::SanPlus, CastlingMode, Chess, Color as ShakmColor, File as ShakmFile,
     Move as ShakmMove, MoveList, Piece as ShakmPiece, Position, Rank as ShakmRank,
     Role, Square as ShakmSquare,
 };
@@ -25,6 +25,8 @@ pub enum ChessOutcome {
 pub struct ChessGame {
     position: Chess,
     history: Vec<Chess>,
+    san_moves: Vec<String>,
+    starting_fen: Option<String>,
     board_moves_played_offset: u16,
     moves_played: u16,
     outcome: Option<ChessOutcome>,
@@ -35,6 +37,8 @@ impl Default for ChessGame {
         Self {
             position: Chess::default(),
             history: Vec::new(),
+            san_moves: Vec::new(),
+            starting_fen: None,
             board_moves_played_offset: 0,
             moves_played: 0,
             outcome: None,
@@ -50,15 +54,184 @@ impl ChessGame {
         let position: Chess = parsed.into_position(CastlingMode::Standard).map_err(|e| anyhow!(
             "Failed to create game board from FEN. Reason: {:?}", e
         ))?;
-        // Count half-moves from FEN fullmove number
-        let initial_moves = 0u16; // shakmaty doesn't track total moves; we track manually
+        let initial_moves = 0u16;
         Ok(Self {
             position,
             history: Vec::new(),
+            san_moves: Vec::new(),
+            starting_fen: Some(fen.to_string()),
             board_moves_played_offset: initial_moves,
             moves_played: initial_moves,
             outcome: None,
         })
+    }
+
+    /// Create a game from a PGN string, replaying all moves to rebuild history.
+    pub fn from_pgn(pgn: &str) -> Result<ChessGame> {
+        // Parse PGN tags
+        let mut starting_fen: Option<String> = None;
+
+        // Extract tags and movetext
+        let mut tag_end = 0;
+        let pgn_bytes = pgn.as_bytes();
+        let mut i = 0;
+        while i < pgn_bytes.len() {
+            // Skip whitespace
+            while i < pgn_bytes.len() && pgn_bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < pgn_bytes.len() && pgn_bytes[i] == b'[' {
+                // Parse tag
+                let tag_start = i;
+                while i < pgn_bytes.len() && pgn_bytes[i] != b']' {
+                    i += 1;
+                }
+                if i < pgn_bytes.len() {
+                    i += 1; // skip ']'
+                }
+                tag_end = i;
+                let tag_str = &pgn[tag_start..tag_end];
+                // Check for FEN tag
+                if let Some(fen_val) = tag_str.strip_prefix("[FEN \"") {
+                    if let Some(fen_val) = fen_val.strip_suffix("\"]") {
+                        starting_fen = Some(fen_val.to_string());
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+
+        let mut movetext = pgn[tag_end..].trim().to_string();
+
+        // Remove result markers
+        for result in &["1-0", "0-1", "1/2-1/2", "*"] {
+            movetext = movetext.replace(result, "");
+        }
+        let movetext = movetext.trim();
+
+        // Create starting position
+        let mut game = if let Some(ref fen) = starting_fen {
+            ChessGame::from_fen(fen)?
+        } else {
+            ChessGame::default()
+        };
+
+        if movetext.is_empty() {
+            return Ok(game);
+        }
+
+        // Parse and replay moves
+        // Remove move numbers (e.g., "1.", "12.", "1...")
+        let re = regex::Regex::new(r"\d+\.+\s*").unwrap();
+        let clean = re.replace_all(movetext, " ");
+        let tokens: Vec<&str> = clean.split_whitespace()
+            .filter(|t| !t.is_empty())
+            .collect();
+
+        for token in tokens {
+            // Skip comments, NAGs, etc.
+            if token.starts_with('{') || token.starts_with('(') || token.starts_with('$') {
+                continue;
+            }
+
+            let san: shakmaty::san::San = token.parse().map_err(|e| anyhow!(
+                "Failed to parse SAN '{}': {:?}", token, e
+            ))?;
+            let the_move = san.to_move(&game.position).map_err(|e| anyhow!(
+                "Illegal SAN '{}': {:?}", token, e
+            ))?;
+
+            // Compute SAN with check/checkmate suffix before playing
+            let san_plus = SanPlus::from_move(game.position.clone(), the_move.clone());
+            game.san_moves.push(san_plus.to_string());
+
+            game.history.push(game.position.clone());
+            game.position.play_unchecked(the_move);
+            game.moves_played += 1;
+        }
+
+        game.update_game_outcome();
+        Ok(game)
+    }
+
+    /// Generate PGN string for the current game.
+    pub fn to_pgn(&self) -> String {
+        let mut pgn = String::new();
+
+        // Tags
+        pgn.push_str("[Event \"chessMarkable Game\"]\n");
+        pgn.push_str("[Site \"reMarkable Paper Pro\"]\n");
+        let date = "????.??.??";
+        pgn.push_str(&format!("[Date \"{}\"]\n", date));
+        pgn.push_str("[White \"Player\"]\n");
+        pgn.push_str("[Black \"Player\"]\n");
+
+        let result = match self.outcome {
+            Some(ChessOutcome::Checkmate { winner: Player::White }) => "1-0",
+            Some(ChessOutcome::Checkmate { winner: Player::Black }) => "0-1",
+            Some(ChessOutcome::Stalemate) => "1/2-1/2",
+            Some(ChessOutcome::Aborted { .. }) => "*",
+            None => "*",
+        };
+        pgn.push_str(&format!("[Result \"{}\"]\n", result));
+
+        if let Some(ref fen) = self.starting_fen {
+            pgn.push_str(&format!("[FEN \"{}\"]\n", fen));
+            pgn.push_str("[SetUp \"1\"]\n");
+        }
+
+        pgn.push('\n');
+
+        // Movetext
+        let start_color = if let Some(ref fen) = self.starting_fen {
+            if fen.contains(" b ") {
+                ShakmColor::Black
+            } else {
+                ShakmColor::White
+            }
+        } else {
+            ShakmColor::White
+        };
+
+        let start_fullmove = if let Some(ref fen) = self.starting_fen {
+            // Parse fullmove number from FEN (last field)
+            fen.split_whitespace().last()
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(1)
+        } else {
+            1
+        };
+
+        let mut fullmove = start_fullmove;
+        let mut is_white_turn = start_color == ShakmColor::White;
+        let mut first_move = true;
+
+        for san in &self.san_moves {
+            if is_white_turn {
+                if !first_move {
+                    pgn.push(' ');
+                }
+                pgn.push_str(&format!("{}. {}", fullmove, san));
+            } else {
+                if first_move {
+                    // Game started on black's turn
+                    pgn.push_str(&format!("{}... {}", fullmove, san));
+                } else {
+                    pgn.push_str(&format!(" {}", san));
+                }
+                fullmove += 1;
+            }
+            is_white_turn = !is_white_turn;
+            first_move = false;
+        }
+
+        if !self.san_moves.is_empty() {
+            pgn.push(' ');
+        }
+        pgn.push_str(result);
+
+        pgn
     }
 
     pub fn position(&self) -> &Chess {
@@ -108,6 +281,7 @@ impl ChessGame {
             if let Some(prev) = self.history.pop() {
                 self.position = prev;
                 self.moves_played -= 1;
+                self.san_moves.pop();
             }
         }
         self.update_game_outcome();
@@ -203,6 +377,9 @@ impl ChessGame {
         let selected_move = selected_move.unwrap().clone();
         let src_sq = move_src(&selected_move).unwrap_or(destination.inner());
 
+        let san_plus = SanPlus::from_move(self.position.clone(), selected_move.clone());
+        self.san_moves.push(san_plus.to_string());
+
         self.history.push(self.position.clone());
         self.position.play_unchecked(selected_move);
         self.moves_played += 1;
@@ -292,6 +469,10 @@ impl ChessGame {
         }
 
         let selected_move = selected_move.unwrap();
+
+        let san_plus = SanPlus::from_move(self.position.clone(), selected_move.clone());
+        self.san_moves.push(san_plus.to_string());
+
         self.history.push(self.position.clone());
         self.position.play_unchecked(selected_move);
         self.moves_played += 1;
