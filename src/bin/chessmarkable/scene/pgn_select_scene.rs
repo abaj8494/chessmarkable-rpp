@@ -8,8 +8,8 @@ use std::io::Read;
 use regex::Regex;
 use crate::REPLAYS_PER_PAGE;
 
-const BOX_HEIGHT: i32 = 180;
-const FIRST_BOX_Y_POS: i32 = 350;
+const BOX_HEIGHT: i32 = 160;
+const FIRST_BOX_Y_POS: i32 = 450;
 
 const EVENT_TAG: &str = "Event";
 const WHITE_TAG: &str = "White";
@@ -131,10 +131,10 @@ impl Scene for PgnSelectScene {
                 canvas.draw_text(
                     Point2 {
                         x: None,
-                        y: Some(300),
+                        y: Some(380),
                     },
                     "Choose PGN:",
-                    75.0,
+                    65.0,
                 );
             }
             self.button_1_hitbox = draw_button_for_pgn(canvas, self.pgn_vec.get(0), FIRST_BOX_Y_POS, 50.0);
@@ -179,10 +179,10 @@ impl Scene for PgnSelectScene {
                 canvas.draw_text(
                     Point2 {
                         x: None,
-                        y: Some(300),
+                        y: Some(380),
                     },
                     "Choose Game:",
-                    75.0,
+                    65.0,
                 );
             }
             let index_of_first_game = (self.current_page_number * REPLAYS_PER_PAGE) as usize;

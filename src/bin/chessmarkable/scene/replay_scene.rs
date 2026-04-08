@@ -501,66 +501,78 @@ impl Scene for ReplayScene {
         if self.first_draw {
             // First frame
             canvas.clear();
+            let btn_y = 1910;
+            let btn_font = 55.0;
+            let btn_vgap = 8;
+            let btn_hgap = 15;
+            let btn_spacing = 20;
+            let nav_font = 80.0;
+
             self.back_button_hitbox = Some(canvas.draw_button(
                 Point2 {
-                    x: Some(50),
-                    y: Some(1770),
+                    x: Some(30),
+                    y: Some(btn_y),
                 },
                 "Quit",
-                75.0,
-                10,
-                20,
-            ));
-            self.full_refresh_button_hitbox = Some(canvas.draw_button(
-                Point2 {
-                    x: Some(crate::DISPLAY_WIDTH as i32 - 260),
-                    y: Some(1770),
-                },
-                "Refresh",
-                75.0,
-                10,
-                20,
-            ));
-            self.reset_button_hitbox = Some(canvas.draw_button(
-                Point2 {
-                    x: Some(
-                        self.back_button_hitbox.unwrap().left as i32 +
-                            self.back_button_hitbox.unwrap().width as i32
-                            + 405
-                    ),
-                    y: Some(1770),
-                },
-                "Reset",
-                60.0,
-                50,
-                50,
+                btn_font,
+                btn_vgap,
+                btn_hgap,
             ));
             self.undo_button_hitbox = Some(canvas.draw_button(
                 Point2 {
                     x: Some(
-                        self.reset_button_hitbox.unwrap().left as i32
-                            - 200
+                        self.back_button_hitbox.unwrap().left as i32
+                            + self.back_button_hitbox.unwrap().width as i32
+                            + btn_spacing,
                     ),
-                    y: Some(1780),
+                    y: Some(btn_y),
                 },
                 "<",
-                125.0,
-                60,
-                100,
+                nav_font,
+                btn_vgap,
+                30,
+            ));
+            self.reset_button_hitbox = Some(canvas.draw_button(
+                Point2 {
+                    x: Some(
+                        self.undo_button_hitbox.unwrap().left as i32
+                            + self.undo_button_hitbox.unwrap().width as i32
+                            + btn_spacing,
+                    ),
+                    y: Some(btn_y),
+                },
+                "Reset",
+                btn_font,
+                btn_vgap,
+                btn_hgap,
             ));
             self.next_move_button_hitbox = Some(canvas.draw_button(
                 Point2 {
                     x: Some(
                         self.reset_button_hitbox.unwrap().left as i32
                             + self.reset_button_hitbox.unwrap().width as i32
-                            + 150
+                            + btn_spacing,
                     ),
-                    y: Some(1780),
+                    y: Some(btn_y),
                 },
                 ">",
-                125.0,
-                60,
-                100,
+                nav_font,
+                btn_vgap,
+                30,
+            ));
+            self.full_refresh_button_hitbox = Some(canvas.draw_button(
+                Point2 {
+                    x: Some(
+                        self.next_move_button_hitbox.unwrap().left as i32
+                            + self.next_move_button_hitbox.unwrap().width as i32
+                            + btn_spacing,
+                    ),
+                    y: Some(btn_y),
+                },
+                "Refresh",
+                btn_font,
+                btn_vgap,
+                btn_hgap,
             ));
             self.redraw_all_squares = true;
             self.draw_board(canvas);

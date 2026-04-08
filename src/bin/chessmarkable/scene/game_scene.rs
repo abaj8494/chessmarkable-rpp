@@ -1238,7 +1238,7 @@ impl Scene for GameScene {
             // First frame
             canvas.clear();
 
-            let btn_font = 50.0;
+            let btn_font = 60.0;
             let btn_vgap = 8;
             let btn_hgap = 15;
             let btn_spacing = 20;
